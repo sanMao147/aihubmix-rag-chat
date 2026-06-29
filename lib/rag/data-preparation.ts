@@ -1,34 +1,32 @@
 import { readdirSync, readFileSync, statSync } from "fs";
 import { join, relative, sep, parse } from "path";
-import type { Document } from "@langchain/core/documents";
-import type { ChunkMetadata, ChunkDocument, KnowledgeBaseStats } from "./types";
+import type { ChunkDocument, ChunkMetadata, DataPreparationState, KnowledgeBaseStats } from "./types";
 import { CATEGORY_MAPPING, CATEGORY_LABELS, DIFFICULTY_LABELS } from "./config";
 import { md5, uuid, getProjectRoot } from "../utils";
 
 /**
  * 数据准备模块（对应原 Python data_preparation.py）
  * 负责：数据加载、元数据增强、Markdown 结构感知分块、父子文档映射
+ *
+ * 已重构为工厂函数 + 状态对象，不再使用 class/this。
  */
-export class DataPreparationModule {
-  /** 父文档（完整食谱） */
-  documents: ChunkDocument[] = [];
-  /** 子文档（按标题分割的小块） */
-  chunks: ChunkDocument[] = [];
-  /** 子块 ID → 父文档 ID 映射 */
-  parentChildMap: Record<string, string> = {};
-
-  constructor(private dataPath: string) {}
+export function createDataPreparation(dataPath: string) {
+  const state: DataPreparationState = {
+    documents: [],
+    chunks: [],
+    parentChildMap: {},
+  };
 
   /**
    * 加载所有 Markdown 文档
    */
-  loadDocuments(): ChunkDocument[] {
-    console.log(`[DataPreparation] 正在从 ${this.dataPath} 加载文档...`);
+  function loadDocuments(): ChunkDocument[] {
+    console.log(`[DataPreparation] 正在从 ${dataPath} 加载文档...`);
 
-    const fullPath = join(getProjectRoot(), this.dataPath);
+    const fullPath = join(getProjectRoot(), dataPath);
     const documents: ChunkDocument[] = [];
 
-    const mdFiles = this.findMarkdownFiles(fullPath);
+    const mdFiles = findMarkdownFiles(fullPath);
 
     for (const mdFile of mdFiles) {
       try {
@@ -64,10 +62,10 @@ export class DataPreparationModule {
 
     // 增强元数据
     for (const doc of documents) {
-      this.enhanceMetadata(doc);
+      enhanceMetadata(doc);
     }
 
-    this.documents = documents;
+    state.documents = documents;
     console.log(`[DataPreparation] 成功加载 ${documents.length} 个文档`);
     return documents;
   }
@@ -75,7 +73,7 @@ export class DataPreparationModule {
   /**
    * 递归查找所有 .md 文件
    */
-  private findMarkdownFiles(dir: string): string[] {
+  function findMarkdownFiles(dir: string): string[] {
     const results: string[] = [];
 
     const walk = (currentDir: string) => {
@@ -98,7 +96,7 @@ export class DataPreparationModule {
   /**
    * 增强文档元数据：提取分类、菜品名、难度
    */
-  private enhanceMetadata(doc: ChunkDocument) {
+  function enhanceMetadata(doc: ChunkDocument) {
     const filePath = doc.metadata.source;
     const pathParts = filePath.split(sep);
 
@@ -135,18 +133,18 @@ export class DataPreparationModule {
    * Markdown 结构感知分块（对应原 Python _markdown_header_split）
    * 按 #/##/### 标题分割，保留标题路径到 metadata
    */
-  chunkDocuments(): ChunkDocument[] {
+  function chunkDocuments(): ChunkDocument[] {
     console.log("[DataPreparation] 正在进行 Markdown 结构感知分块...");
 
-    if (this.documents.length === 0) {
+    if (state.documents.length === 0) {
       throw new Error("请先加载文档");
     }
 
     const allChunks: ChunkDocument[] = [];
 
-    for (const doc of this.documents) {
+    for (const doc of state.documents) {
       try {
-        const mdChunks = this.markdownHeaderSplit(doc);
+        const mdChunks = markdownHeaderSplit(doc);
 
         const parentId = doc.metadata.parent_id;
 
@@ -165,7 +163,7 @@ export class DataPreparationModule {
             chunk_size: chunk.pageContent.length,
           };
 
-          this.parentChildMap[childId] = parentId;
+          state.parentChildMap[childId] = parentId;
         });
 
         allChunks.push(...mdChunks);
@@ -178,7 +176,7 @@ export class DataPreparationModule {
       }
     }
 
-    this.chunks = allChunks;
+    state.chunks = allChunks;
     console.log(
       `[DataPreparation] Markdown 分块完成，共生成 ${allChunks.length} 个 chunk`
     );
@@ -189,7 +187,7 @@ export class DataPreparationModule {
    * Markdown 标题分割器（自行实现，对应 Python MarkdownHeaderTextSplitter）
    * 按 #/##/### 分割，strip_headers=false（保留标题）
    */
-  private markdownHeaderSplit(doc: ChunkDocument): ChunkDocument[] {
+  function markdownHeaderSplit(doc: ChunkDocument): ChunkDocument[] {
     const content = doc.pageContent;
     const lines = content.split("\n");
 
@@ -266,7 +264,7 @@ export class DataPreparationModule {
    * 根据子块获取对应的父文档（智能去重，按相关性排序）
    * 对应原 Python get_parent_documents
    */
-  getParentDocuments(childChunks: ChunkDocument[]): ChunkDocument[] {
+  function getParentDocuments(childChunks: ChunkDocument[]): ChunkDocument[] {
     const parentRelevance: Record<string, number> = {};
     const parentDocsMap: Record<string, ChunkDocument> = {};
 
@@ -277,7 +275,7 @@ export class DataPreparationModule {
       parentRelevance[parentId] = (parentRelevance[parentId] || 0) + 1;
 
       if (!parentDocsMap[parentId]) {
-        for (const doc of this.documents) {
+        for (const doc of state.documents) {
           if (doc.metadata.parent_id === parentId) {
             parentDocsMap[parentId] = doc;
             break;
@@ -304,8 +302,8 @@ export class DataPreparationModule {
   /**
    * 获取数据统计信息
    */
-  getStatistics(): KnowledgeBaseStats {
-    if (this.documents.length === 0) {
+  function getStatistics(): KnowledgeBaseStats {
+    if (state.documents.length === 0) {
       return {
         total_documents: 0,
         total_chunks: 0,
@@ -318,7 +316,7 @@ export class DataPreparationModule {
     const categories: Record<string, number> = {};
     const difficulties: Record<string, number> = {};
 
-    for (const doc of this.documents) {
+    for (const doc of state.documents) {
       const cat = doc.metadata.category || "未知";
       categories[cat] = (categories[cat] || 0) + 1;
 
@@ -327,29 +325,40 @@ export class DataPreparationModule {
     }
 
     const avgChunkSize =
-      this.chunks.length > 0
-        ? this.chunks.reduce(
+      state.chunks.length > 0
+        ? state.chunks.reduce(
             (sum, c) => sum + (c.metadata.chunk_size || 0),
             0
-          ) / this.chunks.length
+          ) / state.chunks.length
         : 0;
 
     return {
-      total_documents: this.documents.length,
-      total_chunks: this.chunks.length,
+      total_documents: state.documents.length,
+      total_chunks: state.chunks.length,
       categories,
       difficulties,
       avg_chunk_size: Math.round(avgChunkSize),
     };
   }
 
-  /** 获取支持的分类标签 */
-  static getSupportedCategories(): string[] {
-    return CATEGORY_LABELS;
-  }
+  return {
+    loadDocuments,
+    chunkDocuments,
+    getParentDocuments,
+    getStatistics,
+    /** 只读状态，外部组合时可用 */
+    get state() {
+      return state;
+    },
+  };
+}
 
-  /** 获取支持的难度标签 */
-  static getSupportedDifficulties(): string[] {
-    return [...DIFFICULTY_LABELS];
-  }
+/** 获取支持的分类标签 */
+export function getSupportedCategories(): string[] {
+  return CATEGORY_LABELS;
+}
+
+/** 获取支持的难度标签 */
+export function getSupportedDifficulties(): string[] {
+  return [...DIFFICULTY_LABELS];
 }

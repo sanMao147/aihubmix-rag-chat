@@ -1,6 +1,6 @@
 import { BM25Retriever } from "@langchain/community/retrievers/bm25";
 import type { Document } from "@langchain/core/documents";
-import type { ChunkDocument, ChunkMetadata } from "./types";
+import type { ChunkDocument, ChunkMetadata, RetrievalEngineApi } from "./types";
 import { md5 } from "../utils";
 
 /** 向量存储接口（duck typing，只需有 similaritySearch 方法） */
@@ -11,37 +11,29 @@ interface VectorStoreLike {
 /**
  * 检索优化模块（对应原 Python retrieval_optimization.py）
  * 负责：向量+BM25 混合检索、RRF 重排、元数据过滤
+ *
+ * 已重构为工厂函数 + 闭包，不再使用 class/this。
  */
-export class RetrievalOptimizationModule {
-  private vectorRetriever: VectorStoreLike;
-  private bm25Retriever: BM25Retriever;
-  private chunks: ChunkDocument[];
-
-  constructor(vectorstore: VectorStoreLike, chunks: ChunkDocument[]) {
-    this.vectorRetriever = vectorstore;
-    this.chunks = chunks;
-
-    // 构建 BM25 检索器
-    this.bm25Retriever = BM25Retriever.fromDocuments(chunks, { k: 5 });
-    console.log("[Retrieval] 检索器设置完成");
-  }
+export function createRetrievalEngine(
+  vectorstore: VectorStoreLike,
+  chunks: ChunkDocument[]
+): RetrievalEngineApi {
+  const bm25Retriever = BM25Retriever.fromDocuments(chunks, { k: 5 });
+  console.log("[Retrieval] 检索器设置完成");
 
   /**
    * 混合检索 - 结合向量检索和 BM25 检索，使用 RRF 重排
    * 对应原 Python hybrid_search
    */
-  async hybridSearch(query: string, topK: number = 3): Promise<ChunkDocument[]> {
+  async function hybridSearch(query: string, topK: number = 3): Promise<ChunkDocument[]> {
     // 向量检索
-    const vectorDocs = (await this.vectorRetriever.similaritySearch(
-      query,
-      5
-    )) as ChunkDocument[];
+    const vectorDocs = (await vectorstore.similaritySearch(query, 5)) as ChunkDocument[];
 
     // BM25 检索
-    const bm25Docs = (await this.bm25Retriever.invoke(query)) as ChunkDocument[];
+    const bm25Docs = (await bm25Retriever.invoke(query)) as ChunkDocument[];
 
     // RRF 重排
-    const rerankedDocs = this.rrfRerank(vectorDocs, bm25Docs);
+    const rerankedDocs = rrfRerank(vectorDocs, bm25Docs);
     return rerankedDocs.slice(0, topK);
   }
 
@@ -49,13 +41,13 @@ export class RetrievalOptimizationModule {
    * 带元数据过滤的检索
    * 对应原 Python metadata_filtered_search
    */
-  async metadataFilteredSearch(
+  async function metadataFilteredSearch(
     query: string,
     filters: Partial<Record<keyof ChunkMetadata, string>>,
     topK: number = 5
   ): Promise<ChunkDocument[]> {
     // 先混合检索，获取更多候选
-    const docs = await this.hybridSearch(query, topK * 3);
+    const docs = await hybridSearch(query, topK * 3);
 
     // 应用元数据过滤
     const filteredDocs: ChunkDocument[] = [];
@@ -84,7 +76,7 @@ export class RetrievalOptimizationModule {
    * 公式: score = 1 / (k + rank + 1)
    * k=60 用于平滑排名
    */
-  private rrfRerank(
+  function rrfRerank(
     vectorDocs: ChunkDocument[],
     bm25Docs: ChunkDocument[],
     k: number = 60
@@ -124,4 +116,9 @@ export class RetrievalOptimizationModule {
 
     return sortedDocs;
   }
+
+  return {
+    hybridSearch,
+    metadataFilteredSearch,
+  };
 }

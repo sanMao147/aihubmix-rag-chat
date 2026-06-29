@@ -24,9 +24,17 @@ import { ChatMessages } from "@/components/chat/chat-messages";
 import { ChatInput } from "@/components/chat/chat-input";
 
 export default function Home() {
-  const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [currentSessionId, setCurrentSession] = useState<string | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [sessions, setSessions] = useState<ChatSession[]>(() => loadSessions());
+  const [currentSessionId, setCurrentSession] = useState<string | null>(() => {
+    const loaded = loadSessions();
+    const id = getCurrentSessionId();
+    return id && loaded.find((s) => s.id === id) ? id : null;
+  });
+  const [messages, setMessages] = useState<ChatMessage[]>(() => {
+    const loaded = loadSessions();
+    const id = getCurrentSessionId();
+    return id ? loaded.find((s) => s.id === id)?.messages || [] : [];
+  });
   const [streamingMessage, setStreamingMessage] = useState<ChatMessage | null>(
     null
   );
@@ -40,33 +48,19 @@ export default function Home() {
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // 初始化：加载历史会话
-  useEffect(() => {
-    const loaded = loadSessions();
-    setSessions(loaded);
-    const currentId = getCurrentSessionId();
-    if (currentId && loaded.find((s) => s.id === currentId)) {
-      setCurrentSession(currentId);
-      setMessages(
-        loaded.find((s) => s.id === currentId)?.messages || []
-      );
-    }
-  }, []);
-
   // 检查知识库状态
   useEffect(() => {
+    async function checkKnowledgeBase() {
+      try {
+        const res = await fetch("/api/knowledge-base");
+        const data = await res.json();
+        setKbStatus({ ready: data.ready, loading: false });
+      } catch {
+        setKbStatus({ ready: false, loading: false });
+      }
+    }
     checkKnowledgeBase();
   }, []);
-
-  const checkKnowledgeBase = async () => {
-    try {
-      const res = await fetch("/api/knowledge-base");
-      const data = await res.json();
-      setKbStatus({ ready: data.ready, loading: false });
-    } catch {
-      setKbStatus({ ready: false, loading: false });
-    }
-  };
 
   // 获取当前会话
   const getCurrentSession = useCallback((): ChatSession | null => {

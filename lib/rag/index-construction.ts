@@ -3,68 +3,60 @@ import { dirname, join } from "path";
 import { OpenAIEmbeddings } from "@langchain/openai";
 import type { Document } from "@langchain/core/documents";
 import type { Embeddings } from "@langchain/core/embeddings";
-import type { ChunkDocument, ChunkMetadata, VectorStoreData } from "./types";
+import type { ChunkDocument, ChunkMetadata, IndexBuilderApi, VectorStoreApi, VectorStoreData } from "./types";
 import { getProjectRoot } from "../utils";
 
 /**
  * 简单的内存向量存储（替代 LangChain 1.x 移除的 MemoryVectorStore）
  * 使用余弦相似度进行搜索，适合中小规模数据（<10k 向量）
+ *
+ * 已重构为工厂函数 + 闭包，不再使用 class/this。
  */
-class SimpleMemoryVectorStore {
-  private vectors: number[][] = [];
-  private documents: Document[] = [];
-  private embeddings: Embeddings;
+export function createVectorStore(embeddings: Embeddings): VectorStoreApi {
+  let vectors: number[][] = [];
+  let documents: Document[] = [];
 
-  constructor(embeddings: Embeddings) {
-    this.embeddings = embeddings;
+  /**
+   * 添加文档（批量向量化）
+   */
+  async function addDocuments(docs: Document[]): Promise<void> {
+    const batch = 50;
+    for (let i = 0; i < docs.length; i += batch) {
+      const chunk = docs.slice(i, i + batch);
+      const texts = chunk.map((d) => d.pageContent);
+      const embeddingsResult = await embeddings.embedDocuments(texts);
+      vectors.push(...embeddingsResult);
+      documents.push(...chunk);
+    }
   }
 
   /**
    * 从文档列表创建向量存储
    */
-  static async fromDocuments(
-    docs: Document[],
-    embeddings: Embeddings
-  ): Promise<SimpleMemoryVectorStore> {
-    const store = new SimpleMemoryVectorStore(embeddings);
-    await store.addDocuments(docs);
-    return store;
-  }
-
-  /**
-   * 添加文档（批量向量化）
-   */
-  async addDocuments(docs: Document[]): Promise<void> {
-    const batch = 50;
-    for (let i = 0; i < docs.length; i += batch) {
-      const chunk = docs.slice(i, i + batch);
-      const texts = chunk.map((d) => d.pageContent);
-      const vectors = await this.embeddings.embedDocuments(texts);
-      this.vectors.push(...vectors);
-      this.documents.push(...chunk);
-    }
+  async function fromDocuments(docs: Document[]): Promise<void> {
+    await addDocuments(docs);
   }
 
   /**
    * 相似度搜索（余弦相似度）
    */
-  async similaritySearch(query: string, k: number = 4): Promise<Document[]> {
-    const queryVector = await this.embeddings.embedQuery(query);
+  async function similaritySearch(query: string, k: number = 4): Promise<Document[]> {
+    const queryVector = await embeddings.embedQuery(query);
 
-    const scores = this.vectors.map((vec, i) => ({
+    const scores = vectors.map((vec, i) => ({
       index: i,
-      score: this.cosineSimilarity(queryVector, vec),
+      score: cosineSimilarity(queryVector, vec),
     }));
 
     scores.sort((a, b) => b.score - a.score);
 
-    return scores.slice(0, k).map((s) => this.documents[s.index]);
+    return scores.slice(0, k).map((s) => documents[s.index]);
   }
 
   /**
    * 余弦相似度计算
    */
-  private cosineSimilarity(a: number[], b: number[]): number {
+  function cosineSimilarity(a: number[], b: number[]): number {
     let dotProduct = 0;
     let normA = 0;
     let normB = 0;
@@ -80,86 +72,78 @@ class SimpleMemoryVectorStore {
   /**
    * 获取所有数据（用于持久化）
    */
-  getData(): { vectors: number[][]; documents: Document[] } {
-    return { vectors: this.vectors, documents: this.documents };
+  function getData(): { vectors: number[][]; documents: Document[] } {
+    return { vectors, documents };
   }
 
   /**
    * 从数据恢复
    */
-  static fromData(
-    data: { vectors: number[][]; documents: Document[] },
-    embeddings: Embeddings
-  ): SimpleMemoryVectorStore {
-    const store = new SimpleMemoryVectorStore(embeddings);
-    store.vectors = data.vectors;
-    store.documents = data.documents;
-    return store;
+  function setData(data: { vectors: number[][]; documents: Document[] }): void {
+    vectors = data.vectors;
+    documents = data.documents;
   }
 
-  /** 向量数量 */
-  get size(): number {
-    return this.vectors.length;
-  }
+  return {
+    fromDocuments,
+    addDocuments,
+    similaritySearch,
+    getData,
+    setData,
+    get size() {
+      return vectors.length;
+    },
+  };
 }
 
 /**
  * 索引构建模块（对应原 Python index_construction.py）
  * 负责：向量化和内存向量索引构建、JSON 持久化
+ *
+ * 已重构为工厂函数 + 纯函数，不再使用 class/this。
  */
-export class IndexConstructionModule {
-  private embeddings: OpenAIEmbeddings;
-  private vectorstore: SimpleMemoryVectorStore | null = null;
-
-  constructor(
-    private modelName: string,
-    private indexSavePath: string,
-    apiKey: string,
-    baseURL: string
-  ) {
-    this.embeddings = new OpenAIEmbeddings({
-      model: modelName,
-      apiKey,
-      configuration: { baseURL },
-    });
-  }
+export function createIndexBuilder(
+  modelName: string,
+  indexSavePath: string,
+  apiKey: string,
+  baseURL: string
+): IndexBuilderApi {
+  const embeddings = new OpenAIEmbeddings({
+    model: modelName,
+    apiKey,
+    configuration: { baseURL },
+  });
 
   /**
    * 构建向量索引
    */
-  async buildVectorIndex(chunks: ChunkDocument[]): Promise<SimpleMemoryVectorStore> {
+  async function buildVectorIndex(chunks: ChunkDocument[]): Promise<VectorStoreApi> {
     console.log("[IndexConstruction] 正在构建向量索引...");
 
     if (chunks.length === 0) {
       throw new Error("文档块列表不能为空");
     }
 
-    this.vectorstore = await SimpleMemoryVectorStore.fromDocuments(
-      chunks,
-      this.embeddings
-    );
+    const vectorstore = createVectorStore(embeddings);
+    await vectorstore.fromDocuments(chunks);
 
     console.log(
-      `[IndexConstruction] 向量索引构建完成，包含 ${this.vectorstore.size} 个向量`
+      `[IndexConstruction] 向量索引构建完成，包含 ${vectorstore.size} 个向量`
     );
-    return this.vectorstore;
+    return vectorstore;
   }
 
   /**
    * 保存向量索引到 JSON 文件
    */
-  async saveIndex(): Promise<void> {
-    if (!this.vectorstore) {
-      throw new Error("请先构建向量索引");
-    }
-
-    const fullPath = join(getProjectRoot(), this.indexSavePath);
+  async function saveIndex(vectorstore: VectorStoreApi): Promise<void> {
+    const fullPath = join(getProjectRoot(), indexSavePath);
     const dir = dirname(fullPath);
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
     }
 
-    const { vectors, documents } = this.vectorstore.getData();
+    const { vectors, documents } = (vectorstore as ReturnType<typeof createVectorStore>).getData();
 
     const data: VectorStoreData = {
       vectors,
@@ -167,24 +151,24 @@ export class IndexConstructionModule {
         pageContent: doc.pageContent,
         metadata: doc.metadata as ChunkMetadata,
       })),
-      embeddingModel: this.modelName,
+      embeddingModel: modelName,
       createdAt: new Date().toISOString(),
     };
 
     writeFileSync(fullPath, JSON.stringify(data), "utf-8");
-    console.log(`[IndexConstruction] 向量索引已保存到: ${this.indexSavePath}`);
+    console.log(`[IndexConstruction] 向量索引已保存到: ${indexSavePath}`);
   }
 
   /**
    * 从 JSON 文件加载向量索引
    * @returns 加载的向量存储，如果文件不存在返回 null
    */
-  async loadIndex(): Promise<SimpleMemoryVectorStore | null> {
-    const fullPath = join(getProjectRoot(), this.indexSavePath);
+  async function loadIndex(): Promise<VectorStoreApi | null> {
+    const fullPath = join(getProjectRoot(), indexSavePath);
 
     if (!existsSync(fullPath)) {
       console.log(
-        `[IndexConstruction] 索引文件不存在: ${this.indexSavePath}，将构建新索引`
+        `[IndexConstruction] 索引文件不存在: ${indexSavePath}，将构建新索引`
       );
       return null;
     }
@@ -193,21 +177,19 @@ export class IndexConstructionModule {
       const raw = readFileSync(fullPath, "utf-8");
       const data: VectorStoreData = JSON.parse(raw);
 
-      this.vectorstore = SimpleMemoryVectorStore.fromData(
-        {
-          vectors: data.vectors,
-          documents: data.documents.map((d) => ({
-            pageContent: d.pageContent,
-            metadata: d.metadata,
-          })),
-        },
-        this.embeddings
-      );
+      const vectorstore = createVectorStore(embeddings);
+      vectorstore.setData({
+        vectors: data.vectors,
+        documents: data.documents.map((d) => ({
+          pageContent: d.pageContent,
+          metadata: d.metadata,
+        })),
+      });
 
       console.log(
-        `[IndexConstruction] 向量索引已从 ${this.indexSavePath} 加载（${this.vectorstore.size} 个向量）`
+        `[IndexConstruction] 向量索引已从 ${indexSavePath} 加载（${vectorstore.size} 个向量）`
       );
-      return this.vectorstore;
+      return vectorstore;
     } catch (e) {
       console.warn(`[IndexConstruction] 加载向量索引失败:`, e);
       return null;
@@ -217,12 +199,15 @@ export class IndexConstructionModule {
   /**
    * 相似度搜索
    */
-  async similaritySearch(query: string, k: number = 5): Promise<ChunkDocument[]> {
-    if (!this.vectorstore) {
-      throw new Error("请先构建或加载向量索引");
-    }
-
-    const results = await this.vectorstore.similaritySearch(query, k);
+  async function similaritySearch(vectorstore: VectorStoreApi, query: string, k: number = 5): Promise<ChunkDocument[]> {
+    const results = await vectorstore.similaritySearch(query, k);
     return results as ChunkDocument[];
   }
+
+  return {
+    buildVectorIndex,
+    saveIndex,
+    loadIndex,
+    similaritySearch,
+  };
 }

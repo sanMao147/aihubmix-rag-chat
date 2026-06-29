@@ -1,39 +1,36 @@
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatPromptTemplate, PromptTemplate } from "@langchain/core/prompts";
-import { RunnablePassthrough } from "@langchain/core/runnables";
 import { StringOutputParser } from "@langchain/core/output_parsers";
-import type { ChunkDocument, RouteType, ChatMessage } from "./types";
+import type { ChunkDocument, RouteType, LLMEngineApi } from "./types";
 
 /**
  * 生成集成模块（对应原 Python generation_integration.py）
  * 负责：LLM 集成、查询路由/重写、基础/分步/列表回答、流式输出
+ *
+ * 已重构为工厂函数 + 闭包，不再使用 class/this。
  */
-export class GenerationIntegrationModule {
-  private llm: ChatOpenAI;
-
-  constructor(
-    modelName: string,
-    temperature: number,
-    maxTokens: number,
-    apiKey: string,
-    baseURL: string
-  ) {
-    this.llm = new ChatOpenAI({
-      model: modelName,
-      temperature,
-      maxTokens,
-      apiKey,
-      configuration: { baseURL },
-      streaming: true,
-    });
-    console.log(`[Generation] LLM 初始化完成: ${modelName}`);
-  }
+export function createLLMEngine(
+  modelName: string,
+  temperature: number,
+  maxTokens: number,
+  apiKey: string,
+  baseURL: string
+): LLMEngineApi {
+  const llm = new ChatOpenAI({
+    model: modelName,
+    temperature,
+    maxTokens,
+    apiKey,
+    configuration: { baseURL },
+    streaming: true,
+  });
+  console.log(`[Generation] LLM 初始化完成: ${modelName}`);
 
   /**
    * 查询路由 - 根据查询类型选择不同的处理方式
    * 返回: 'list' | 'detail' | 'general'
    */
-  async queryRouter(query: string): Promise<RouteType> {
+  async function queryRouter(query: string): Promise<RouteType> {
     const prompt = ChatPromptTemplate.fromTemplate(`根据用户的问题，将其分类为以下三种类型之一：
 
 1. 'list' - 用户想要获取菜品列表或推荐，只需要菜名
@@ -51,7 +48,7 @@ export class GenerationIntegrationModule {
 
 分类结果:`);
 
-    const chain = prompt.pipe(this.llm).pipe(new StringOutputParser());
+    const chain = prompt.pipe(llm).pipe(new StringOutputParser());
     const result = (await chain.invoke({ query })).trim().toLowerCase();
 
     if (result.includes("list")) return "list";
@@ -62,7 +59,7 @@ export class GenerationIntegrationModule {
   /**
    * 智能查询重写 - 让大模型判断是否需要重写查询
    */
-  async queryRewrite(query: string): Promise<string> {
+  async function queryRewrite(query: string): Promise<string> {
     const prompt = PromptTemplate.fromTemplate(`你是一个智能查询分析助手。请分析用户的查询，判断是否需要重写以提高食谱搜索效果。
 
 原始查询: {query}
@@ -94,7 +91,7 @@ export class GenerationIntegrationModule {
 
 请输出最终查询（如果不需要重写就返回原查询）:`);
 
-    const chain = prompt.pipe(this.llm).pipe(new StringOutputParser());
+    const chain = prompt.pipe(llm).pipe(new StringOutputParser());
     const response = (await chain.invoke({ query })).trim();
 
     if (response !== query) {
@@ -107,7 +104,7 @@ export class GenerationIntegrationModule {
   /**
    * 生成列表式回答 - 适用于推荐类查询
    */
-  generateListAnswer(
+  function generateListAnswer(
     query: string,
     contextDocs: ChunkDocument[]
   ): { content: string; isList: true } {
@@ -148,13 +145,13 @@ export class GenerationIntegrationModule {
    * 生成基础回答 - 流式输出
    * 对应原 Python generate_basic_answer_stream
    */
-  async *generateBasicAnswerStream(
+  async function *generateBasicAnswerStream(
     query: string,
     contextDocs: ChunkDocument[],
     history: Array<{ role: string; content: string }> = []
   ): AsyncGenerator<string> {
-    const context = this.buildContext(contextDocs);
-    const historyText = this.buildHistory(history);
+    const context = buildContext(contextDocs);
+    const historyText = buildHistory(history);
 
     const prompt = ChatPromptTemplate.fromTemplate(`你是一位专业的烹饪助手。请根据以下食谱信息回答用户的问题。
 
@@ -169,7 +166,7 @@ ${historyText}
 
 回答:`);
 
-    const chain = prompt.pipe(this.llm).pipe(new StringOutputParser());
+    const chain = prompt.pipe(llm).pipe(new StringOutputParser());
 
     const stream = await chain.stream({
       question: query,
@@ -185,13 +182,13 @@ ${historyText}
    * 生成分步骤回答 - 流式输出
    * 对应原 Python generate_step_by_step_answer_stream
    */
-  async *generateStepByStepAnswerStream(
+  async function *generateStepByStepAnswerStream(
     query: string,
     contextDocs: ChunkDocument[],
     history: Array<{ role: string; content: string }> = []
   ): AsyncGenerator<string> {
-    const context = this.buildContext(contextDocs);
-    const historyText = this.buildHistory(history);
+    const context = buildContext(contextDocs);
+    const historyText = buildHistory(history);
 
     const prompt = ChatPromptTemplate.fromTemplate(`你是一位专业的烹饪导师。请根据食谱信息，为用户提供详细的分步骤指导。
 
@@ -204,16 +201,16 @@ ${historyText}
 
 请灵活组织回答，建议包含以下部分（可根据实际内容调整）：
 
-## 🥘 菜品介绍
+## 菜品介绍
 [简要介绍菜品特点和难度]
 
-## 🛒 所需食材
+## 所需食材
 [列出主要食材和用量]
 
-## 👨‍🍳 制作步骤
+## 制作步骤
 [详细的分步骤说明，每步包含具体操作和大概所需时间]
 
-## 💡 制作技巧
+## 制作技巧
 [仅在有实用技巧时包含。优先使用原文中的实用技巧，如果原文的"附加内容"与烹饪无关或为空，可以基于制作步骤总结关键要点，或者完全省略此部分]
 
 注意：
@@ -224,7 +221,7 @@ ${historyText}
 
 回答:`);
 
-    const chain = prompt.pipe(this.llm).pipe(new StringOutputParser());
+    const chain = prompt.pipe(llm).pipe(new StringOutputParser());
 
     const stream = await chain.stream({
       question: query,
@@ -240,7 +237,7 @@ ${historyText}
    * 构建上下文字符串
    * 对应原 Python _build_context
    */
-  private buildContext(docs: ChunkDocument[], maxLength: number = 2000): string {
+  function buildContext(docs: ChunkDocument[], maxLength: number = 2000): string {
     if (docs.length === 0) {
       return "暂无相关食谱信息。";
     }
@@ -278,7 +275,7 @@ ${historyText}
   /**
    * 构建对话历史文本
    */
-  private buildHistory(
+  function buildHistory(
     history: Array<{ role: string; content: string }>
   ): string {
     if (history.length === 0) {
@@ -292,4 +289,12 @@ ${historyText}
 
     return `对话历史:\n${lines.join("\n")}\n`;
   }
+
+  return {
+    queryRouter,
+    queryRewrite,
+    generateListAnswer,
+    generateBasicAnswerStream,
+    generateStepByStepAnswerStream,
+  };
 }
