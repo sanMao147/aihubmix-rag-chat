@@ -1,6 +1,11 @@
 import { createHash } from "crypto";
 
 /**
+ * lib 通用工具函数。
+ * 这里保持无业务依赖，便于服务端 RAG 模块和前端状态模块共同复用。
+ */
+
+/**
  * 生成 MD5 哈希（与 Python hashlib.md5 结果一致）
  */
 export function md5(text: string): string {
@@ -18,6 +23,7 @@ export function uuid(): string {
  * 合并类名（过滤 falsy 值）
  */
 export function cn(...classes: Array<string | false | undefined | null>): string {
+  // UI 侧常用的小工具：避免手写条件 class 时留下 false/undefined。
   return classes.filter(Boolean).join(" ");
 }
 
@@ -25,6 +31,7 @@ export function cn(...classes: Array<string | false | undefined | null>): string
  * 格式化时间戳为可读字符串
  */
 export function formatTime(timestamp: number): string {
+  // 只做轻量相对时间展示，超过一周交给本地化日期格式处理。
   const date = new Date(timestamp);
   const now = new Date();
   const diff = now.getTime() - date.getTime();

@@ -4,23 +4,36 @@ import type {
   SourceDoc,
   RouteType,
   RAGSystem,
+  SearchStrategy,
 } from "./types";
 import { createDataPreparation, getSupportedCategories, getSupportedDifficulties } from "./data-preparation";
 import { createIndexBuilder } from "./index-construction";
 import { createRetrievalEngine } from "./retrieval";
 import { createLLMEngine } from "./generation";
+import { createGraphRAGRetrieval } from "./graph-rag-retrieval";
+import { createGraphIndexing } from "./graph-indexing";
+import { buildGraphFromMarkdown } from "./graph-data-import";
+import { loadNeo4jConfig, initNeo4jDriver, testNeo4jConnection, closeNeo4jDriver } from "./neo4j-connection";
+import { md5 } from "../utils";
 
 /**
  * RAG 系统主工厂函数（对应原 Python main.py RecipeRAGSystem）
- * 串联：数据准备 → 索引构建 → 检索优化 → 生成集成
+ * 串联：数据准备 → 索引构建 → 检索优化 → 图检索 → 生成集成
  *
  * 已重构为工厂函数 + 闭包，不再使用 class/this。
  */
 export function createRAGSystem(config: RAGConfig): RAGSystem {
+  // 各子模块延迟初始化，避免导入文件时就读取环境变量或构建索引。
   let dataModule: ReturnType<typeof createDataPreparation> | null = null;
   let indexModule: ReturnType<typeof createIndexBuilder> | null = null;
   let retrievalModule: ReturnType<typeof createRetrievalEngine> | null = null;
   let generationModule: ReturnType<typeof createLLMEngine> | null = null;
+
+  // 图 RAG 模块
+  let graphEnabled = false;
+  let graphIndex: ReturnType<typeof createGraphIndexing> | null = null;
+  let graphRetrieval: ReturnType<typeof createGraphRAGRetrieval> | null = null;
+
   let initialized = false;
 
   /**
@@ -46,6 +59,29 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
       config.baseURL
     );
 
+    // 尝试初始化 Neo4j 图模块
+    const neo4jConfig = loadNeo4jConfig();
+    if (neo4jConfig) {
+      const driver = initNeo4jDriver(neo4jConfig);
+      if (driver) {
+        graphIndex = createGraphIndexing();
+        graphRetrieval = createGraphRAGRetrieval(
+          config.llmModel,
+          config.temperature,
+          config.maxTokens,
+          config.apiKey,
+          config.baseURL,
+          graphIndex
+        );
+        graphEnabled = true;
+        console.log("[RAGSystem] 图 RAG 模块已启用");
+      } else {
+        console.log("[RAGSystem] Neo4j driver 初始化失败，图 RAG 降级禁用");
+      }
+    } else {
+      console.log("[RAGSystem] 未配置 Neo4j 环境变量，图 RAG 已禁用，使用纯传统检索");
+    }
+
     initialized = true;
     console.log("[RAGSystem] 系统初始化完成");
   }
@@ -70,12 +106,13 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
 
     if (vectorstore) {
       console.log("[RAGSystem] 成功加载已保存的向量索引");
-      // 仍需加载文档和分块用于检索模块
       dataModule.loadDocuments();
       const chunks = dataModule.chunkDocuments();
 
-      // 重建检索器
-      retrievalModule = createRetrievalEngine(vectorstore, chunks);
+      // 重建检索器（含双层关键词能力）
+      retrievalModule = createRetrievalEngine(vectorstore, chunks, {
+        extractKeywords: generationModule?.extractQueryKeywords,
+      });
     } else {
       console.log("[RAGSystem] 未找到已保存的索引，开始构建新索引...");
 
@@ -92,10 +129,29 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
       await indexModule.saveIndex(vectorstore);
 
       // 6. 初始化检索模块
-      retrievalModule = createRetrievalEngine(vectorstore, chunks);
+      retrievalModule = createRetrievalEngine(vectorstore, chunks, {
+        extractKeywords: generationModule?.extractQueryKeywords,
+      });
     }
 
-    // 7. 显示统计信息
+    // 7. 尝试构建图数据库
+    if (graphEnabled) {
+      try {
+        const graphBuilt = await buildGraphFromMarkdown(config.dataPath);
+        if (graphBuilt && graphIndex) {
+          await graphIndex.initialize();
+          if (graphRetrieval) {
+            await graphRetrieval.initialize();
+          }
+          console.log("[RAGSystem] 图数据构建与索引初始化完成");
+        }
+      } catch (error) {
+        console.warn("[RAGSystem] 图数据构建失败，图 RAG 降级禁用:", error);
+        graphEnabled = false;
+      }
+    }
+
+    // 8. 显示统计信息
     const stats = dataModule.getStatistics();
     console.log("[RAGSystem] 知识库统计:", stats);
     console.log("[RAGSystem] 知识库构建完成");
@@ -129,36 +185,85 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
     const routeType = await generationModule.queryRouter(question);
     console.log(`[RAGSystem] 查询类型: ${routeType}`);
 
-    // 2. 智能查询重写（根据路由类型）
+    // 2. 智能查询分析（路由策略选择）
+    let strategy: SearchStrategy = "hybrid_traditional";
+    let queryAnalysisResult = null;
+    if (graphEnabled) {
+      try {
+        queryAnalysisResult = await generationModule.analyzeQuery(question);
+        strategy = queryAnalysisResult.recommendedStrategy;
+        console.log(
+          `[RAGSystem] 路由策略: ${strategy}, 复杂度: ${queryAnalysisResult.queryComplexity}, 置信度: ${queryAnalysisResult.confidence}`
+        );
+      } catch (error) {
+        console.warn("[RAGSystem] 查询分析失败，降级到传统检索:", error);
+        strategy = "hybrid_traditional";
+      }
+    }
+
+    // 3. 智能查询重写
     let rewrittenQuery = question;
     if (routeType !== "list") {
       console.log("[RAGSystem] 智能分析查询...");
       rewrittenQuery = await generationModule.queryRewrite(question);
     }
 
-    // 3. 检索相关子块（自动应用元数据过滤）
-    const filters = extractFiltersFromQuery(question);
+    // 4. 根据策略执行检索
     let relevantChunks: ChunkDocument[];
 
-    if (Object.keys(filters).length > 0) {
-      console.log("[RAGSystem] 应用过滤条件:", filters);
-      relevantChunks = await retrievalModule.metadataFilteredSearch(
-        rewrittenQuery,
-        filters,
-        config.topK
-      );
+    const filters = extractFiltersFromQuery(question);
+
+    if (strategy === "graph_rag") {
+      // 纯图 RAG 检索
+      const graphDocs = graphRetrieval
+        ? await graphRetrieval.graphRagSearch(rewrittenQuery, config.topK * 2)
+        : [];
+      if (graphDocs.length > 0) {
+        relevantChunks = graphDocs.slice(0, config.topK);
+        console.log(`[RAGSystem] 图 RAG 检索: ${relevantChunks.length} 个结果`);
+      } else {
+        // 图检索无结果，降级到传统检索
+        console.log("[RAGSystem] 图 RAG 无结果，降级到传统检索");
+        relevantChunks = await doTraditionalSearch(rewrittenQuery, filters, config.topK);
+      }
+    } else if (strategy === "combined") {
+      // 组合检索：传统 + 图 RAG 并行
+      const halfK = Math.max(1, Math.ceil(config.topK / 2));
+      const [traditionalDocs, graphDocs] = await Promise.all([
+        doTraditionalSearch(rewrittenQuery, filters, halfK),
+        graphRetrieval ? graphRetrieval.graphRagSearch(rewrittenQuery, halfK) : Promise.resolve([]),
+      ]);
+
+      // Round-robin 交替合并去重
+      const seenIds = new Set<string>();
+      const combined: ChunkDocument[] = [];
+      const maxLen = Math.max(traditionalDocs.length, graphDocs.length);
+      for (let i = 0; i < maxLen; i++) {
+        if (i < traditionalDocs.length) {
+          const dedupKey = traditionalDocs[i].metadata.parent_id || md5(traditionalDocs[i].pageContent);
+          if (!seenIds.has(dedupKey)) {
+            seenIds.add(dedupKey);
+            combined.push(traditionalDocs[i]);
+          }
+        }
+        if (i < graphDocs.length) {
+          const dedupKey = graphDocs[i].metadata.parent_id || md5(graphDocs[i].pageContent);
+          if (!seenIds.has(dedupKey)) {
+            seenIds.add(dedupKey);
+            combined.push(graphDocs[i]);
+          }
+        }
+      }
+      relevantChunks = combined.slice(0, config.topK);
+      console.log(`[RAGSystem] 组合检索: 传统 ${traditionalDocs.length} + 图 ${graphDocs.length} → ${relevantChunks.length} 个结果`);
     } else {
-      relevantChunks = await retrievalModule.hybridSearch(
-        rewrittenQuery,
-        config.topK
-      );
+      // 默认：传统混合检索
+      relevantChunks = await doTraditionalSearch(rewrittenQuery, filters, config.topK);
     }
 
-    console.log(
-      `[RAGSystem] 找到 ${relevantChunks.length} 个相关文档块`
-    );
+    console.log(`[RAGSystem] 找到 ${relevantChunks.length} 个相关文档块`);
 
-    // 4. 检查是否找到相关内容
+    // 5. 检查是否找到相关内容
     if (relevantChunks.length === 0) {
       return {
         sources: [],
@@ -169,10 +274,24 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
       };
     }
 
-    // 5. 获取父文档
-    const relevantDocs = dataModule.getParentDocuments(relevantChunks);
+    // 6. 可配置父文档回填
+    let relevantDocs: ChunkDocument[];
+    if (config.enableParentDocRetrieval) {
+      const topN = Math.min(config.parentDocTopN, relevantChunks.length);
+      const topChunks = relevantChunks.slice(0, topN);
+      const parentDocs = dataModule.getParentDocuments(topChunks, config.parentDocMaxChars);
 
-    // 6. 构建来源文档信息
+      // 前 N 名用完整父文档替换 chunk，其余保持原样
+      relevantDocs = [
+        ...parentDocs,
+        ...relevantChunks.slice(topN),
+      ].slice(0, config.topK);
+      console.log(`[RAGSystem] 父文档回填: 前 ${topN} 名替换为完整父文档`);
+    } else {
+      relevantDocs = dataModule.getParentDocuments(relevantChunks);
+    }
+
+    // 7. 构建来源文档信息
     const sources: SourceDoc[] = relevantChunks.map((chunk) => ({
       dish_name: chunk.metadata.dish_name || "未知菜品",
       category: chunk.metadata.category || "未知",
@@ -186,27 +305,21 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
       (s, i, arr) => arr.findIndex((x) => x.dish_name === s.dish_name) === i
     );
 
-    // 7. 根据路由类型选择回答方式
+    // 8. 根据路由类型选择回答方式
     let stream: AsyncGenerator<string>;
 
     if (routeType === "list") {
-      // 列表查询：直接返回菜品名称列表
-      const result = generationModule.generateListAnswer(
-        question,
-        relevantDocs
-      );
+      const result = generationModule.generateListAnswer(question, relevantDocs);
       stream = (async function* () {
         yield result.content;
       })();
     } else if (routeType === "detail") {
-      // 详细查询：分步指导模式
       stream = generationModule.generateStepByStepAnswerStream(
         question,
         relevantDocs,
         history
       );
     } else {
-      // 一般查询：基础回答模式
       stream = generationModule.generateBasicAnswerStream(
         question,
         relevantDocs,
@@ -218,13 +331,30 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
   }
 
   /**
+   * 传统混合检索（带双层关键词增强）
+   */
+  async function doTraditionalSearch(
+    query: string,
+    filters: Record<string, string>,
+    topK: number
+  ): Promise<ChunkDocument[]> {
+    if (!retrievalModule) return [];
+
+    if (Object.keys(filters).length > 0) {
+      console.log("[RAGSystem] 应用过滤条件:", filters);
+      return retrievalModule.metadataFilteredSearch(query, filters, topK);
+    }
+    // 使用增强检索（双层关键词 + 向量 + BM25）
+    return retrievalModule.enhancedSearch(query, topK);
+  }
+
+  /**
    * 从用户问题中提取元数据过滤条件
    * 对应原 Python _extract_filters_from_query
    */
   function extractFiltersFromQuery(query: string): Record<string, string> {
     const filters: Record<string, string> = {};
 
-    // 分类关键词
     const categoryKeywords = getSupportedCategories();
     for (const cat of categoryKeywords) {
       if (query.includes(cat)) {
@@ -233,7 +363,6 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
       }
     }
 
-    // 难度关键词（按长度降序匹配，避免"简单"匹配到"非常简单"）
     const difficultyKeywords = getSupportedDifficulties().sort((a, b) => b.length - a.length);
     for (const diff of difficultyKeywords) {
       if (query.includes(diff)) {
@@ -274,3 +403,4 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
     isReady,
   };
 }
+

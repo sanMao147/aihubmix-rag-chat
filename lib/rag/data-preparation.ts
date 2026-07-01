@@ -11,6 +11,7 @@ import { md5, uuid, getProjectRoot } from "../utils";
  * 已重构为工厂函数 + 状态对象，不再使用 class/this。
  */
 export function createDataPreparation(dataPath: string) {
+  // 工厂闭包内维护一次构建过程的中间状态，外部只通过公开方法读取结果。
   const state: DataPreparationState = {
     documents: [],
     chunks: [],
@@ -33,6 +34,7 @@ export function createDataPreparation(dataPath: string) {
         const content = readFileSync(mdFile, "utf-8");
 
         // 生成确定性 parent_id（基于数据根目录的相对路径）
+        // 这样即使文件绝对路径随部署环境变化，同一食谱仍能得到稳定 ID。
         const dataRoot = fullPath;
         let relativePath: string;
         try {
@@ -77,6 +79,7 @@ export function createDataPreparation(dataPath: string) {
     const results: string[] = [];
 
     const walk = (currentDir: string) => {
+      // 当前数据集规模较小，使用同步文件系统 API 可以让构建流程更直观。
       const entries = readdirSync(currentDir);
       for (const entry of entries) {
         const fullPath = join(currentDir, entry);
@@ -152,6 +155,7 @@ export function createDataPreparation(dataPath: string) {
           const childId = uuid();
 
           // 合并原文档元数据
+          // 子块继承父文档的分类/菜名/难度，同时补充分块定位信息。
           chunk.metadata = {
             ...doc.metadata,
             ...chunk.metadata,
@@ -191,10 +195,7 @@ export function createDataPreparation(dataPath: string) {
     const content = doc.pageContent;
     const lines = content.split("\n");
 
-    // 标题正则：匹配 1-3 级标题
     const headerRegex = /^(#{1,3})\s+(.+)$/;
-
-    // 当前标题路径栈
     const headerStack: Array<{ level: number; text: string }> = [];
     const chunks: ChunkDocument[] = [];
 
@@ -221,50 +222,37 @@ export function createDataPreparation(dataPath: string) {
 
     for (const line of lines) {
       const match = line.match(headerRegex);
-
       if (match) {
-        // 遇到新标题，先保存当前 chunk
         flushChunk();
-
         const level = match[1].length;
         const text = match[2].trim();
-
-        // 更新标题栈：弹出级别 >= 当前的标题
         while (headerStack.length > 0 && headerStack[headerStack.length - 1].level >= level) {
           headerStack.pop();
         }
         headerStack.push({ level, text });
-
-        // 标题行本身加入新 chunk（strip_headers=false）
         currentLines.push(line);
         hasContent = true;
       } else {
         currentLines.push(line);
-        if (line.trim()) {
-          hasContent = true;
-        }
+        if (line.trim()) hasContent = true;
       }
     }
-
-    // 保存最后一个 chunk
     flushChunk();
 
-    // 如果没有分割成功，将整个文档作为一个 chunk
     if (chunks.length === 0) {
       chunks.push({
         pageContent: content,
         metadata: { ...doc.metadata } as ChunkMetadata,
       });
     }
-
     return chunks;
   }
 
   /**
-   * 根据子块获取对应的父文档（智能去重，按相关性排序）
+   * 根据子块获取对应的父文档（智能去重，按相关性排序，支持字符截断）
    * 对应原 Python get_parent_documents
    */
-  function getParentDocuments(childChunks: ChunkDocument[]): ChunkDocument[] {
+  function getParentDocuments(childChunks: ChunkDocument[], maxChars: number = 4000): ChunkDocument[] {
     const parentRelevance: Record<string, number> = {};
     const parentDocsMap: Record<string, ChunkDocument> = {};
 
@@ -292,10 +280,18 @@ export function createDataPreparation(dataPath: string) {
     const parentDocs: ChunkDocument[] = [];
     for (const parentId of sortedParentIds) {
       if (parentDocsMap[parentId]) {
-        parentDocs.push(parentDocsMap[parentId]);
+        const doc = parentDocsMap[parentId];
+        // 截断过长的父文档
+        if (maxChars > 0 && doc.pageContent.length > maxChars) {
+          const truncated = { ...doc, pageContent: doc.pageContent.slice(0, maxChars) + "\n...(内容已截断)" };
+          parentDocs.push(truncated as ChunkDocument);
+        } else {
+          parentDocs.push(doc);
+        }
       }
     }
 
+    // 返回父文档而不是子块，给生成阶段提供更完整的食谱上下文。
     return parentDocs;
   }
 

@@ -1,5 +1,6 @@
 import { createRAGSystem } from "../rag/rag-system";
 import { loadConfig } from "../rag/config";
+import { closeNeo4jDriver } from "../rag/neo4j-connection";
 import type { RAGSystem } from "../rag/types";
 
 /**
@@ -18,6 +19,7 @@ const globalForRAG = globalThis as unknown as {
  */
 export function getRAGSystem(): RAGSystem {
   if (!globalForRAG.__ragSystem) {
+    // 首次访问时才读取配置，避免模块导入阶段因缺少环境变量直接失败。
     const config = loadConfig();
     globalForRAG.__ragSystem = createRAGSystem(config);
   }
@@ -36,6 +38,7 @@ export async function getInitializedRAGSystem(): Promise<RAGSystem> {
   }
 
   if (!globalForRAG.__ragInitPromise) {
+    // 缓存初始化 Promise，多个并发请求会等待同一次知识库构建。
     globalForRAG.__ragInitPromise = (async () => {
       system.initializeSystem();
       await system.buildKnowledgeBase();
@@ -53,3 +56,12 @@ export function resetRAGSystem(): void {
   globalForRAG.__ragSystem = undefined;
   globalForRAG.__ragInitPromise = undefined;
 }
+
+/**
+ * 进程退出时清理资源（在入口文件注册）
+ */
+export async function cleanupRAGResources(): Promise<void> {
+  await closeNeo4jDriver();
+  console.log("[RAGInstance] RAG 资源已清理");
+}
+

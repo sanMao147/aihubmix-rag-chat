@@ -50,15 +50,37 @@ export interface RAGConfig {
   baseURL: string;
   /** 多轮对话保留的历史轮数 */
   maxHistoryRounds: number;
+  /** Neo4j URI，未配置时禁用图检索 */
+  neo4jUri?: string;
+  /** Neo4j 用户名 */
+  neo4jUser?: string;
+  /** Neo4j 密码 */
+  neo4jPassword?: string;
+  /** Neo4j 数据库名 */
+  neo4jDatabase?: string;
+  /** 是否启用父文档回填 */
+  enableParentDocRetrieval: boolean;
+  /** 父文档回填前 N 名 */
+  parentDocTopN: number;
+  /** 父文档最大字符数 */
+  parentDocMaxChars: number;
+  /** 图 RAG 最大遍历深度 */
+  maxGraphDepth: number;
+  /** 文档分块大小 */
+  chunkSize: number;
+  /** 文档分块重叠 */
+  chunkOverlap: number;
 }
 
 /** 从环境变量读取配置 */
 export function loadConfig(): RAGConfig {
+  // API Key 是唯一强制项；其他参数都有适合本地开发的默认值。
   const apiKey = process.env.AIHUBMIX_API_KEY;
   if (!apiKey) {
     throw new Error("请设置 AIHUBMIX_API_KEY 环境变量");
   }
 
+  // 默认路径保持相对项目根目录，便于开发、部署和测试环境复用同一套配置。
   return {
     dataPath: process.env.RAG_DATA_PATH || "data/dishes",
     indexSavePath: process.env.RAG_INDEX_PATH || ".data/vector-store.json",
@@ -70,5 +92,16 @@ export function loadConfig(): RAGConfig {
     apiKey,
     baseURL: process.env.AIHUBMIX_BASE_URL || "https://aihubmix.com/v1",
     maxHistoryRounds: 6,
+    neo4jUri: process.env.NEO4J_URI,
+    neo4jUser: process.env.NEO4J_USER,
+    neo4jPassword: process.env.NEO4J_PASSWORD,
+    neo4jDatabase: process.env.NEO4J_DATABASE || "neo4j",
+    enableParentDocRetrieval: process.env.ENABLE_PARENT_DOC_RETRIEVAL !== "false",
+    parentDocTopN: parseInt(process.env.PARENT_DOC_TOP_N || "3", 10),
+    parentDocMaxChars: parseInt(process.env.PARENT_DOC_MAX_CHARS || "4000", 10),
+    maxGraphDepth: parseInt(process.env.MAX_GRAPH_DEPTH || "3", 10),
+    chunkSize: parseInt(process.env.CHUNK_SIZE || "1000", 10),
+    chunkOverlap: parseInt(process.env.CHUNK_OVERLAP || "200", 10),
   };
 }
+

@@ -13,6 +13,7 @@ import { getProjectRoot } from "../utils";
  * 已重构为工厂函数 + 闭包，不再使用 class/this。
  */
 export function createVectorStore(embeddings: Embeddings): VectorStoreApi {
+  // vectors 与 documents 使用相同下标关联，不额外维护 ID 索引。
   let vectors: number[][] = [];
   let documents: Document[] = [];
 
@@ -22,6 +23,7 @@ export function createVectorStore(embeddings: Embeddings): VectorStoreApi {
   async function addDocuments(docs: Document[]): Promise<void> {
     const batch = 50;
     for (let i = 0; i < docs.length; i += batch) {
+      // 批量调用 embedding 接口，避免一次性提交过多文本导致请求过大。
       const chunk = docs.slice(i, i + batch);
       const texts = chunk.map((d) => d.pageContent);
       const embeddingsResult = await embeddings.embedDocuments(texts);
@@ -43,6 +45,7 @@ export function createVectorStore(embeddings: Embeddings): VectorStoreApi {
   async function similaritySearch(query: string, k: number = 4): Promise<Document[]> {
     const queryVector = await embeddings.embedQuery(query);
 
+    // 逐条计算 query 与索引向量的余弦相似度，再按分数降序截断。
     const scores = vectors.map((vec, i) => ({
       index: i,
       score: cosineSimilarity(queryVector, vec),
@@ -108,6 +111,7 @@ export function createIndexBuilder(
   apiKey: string,
   baseURL: string
 ): IndexBuilderApi {
+  // LangChain OpenAI 客户端通过 baseURL 接入 AIHubMix 兼容接口。
   const embeddings = new OpenAIEmbeddings({
     model: modelName,
     apiKey,
@@ -177,6 +181,7 @@ export function createIndexBuilder(
       const raw = readFileSync(fullPath, "utf-8");
       const data: VectorStoreData = JSON.parse(raw);
 
+      // 从 JSON 恢复时不重新计算 embedding，直接装载已持久化的向量和文档。
       const vectorstore = createVectorStore(embeddings);
       vectorstore.setData({
         vectors: data.vectors,

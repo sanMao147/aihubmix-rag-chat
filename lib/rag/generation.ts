@@ -1,11 +1,11 @@
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatPromptTemplate, PromptTemplate } from "@langchain/core/prompts";
 import { StringOutputParser } from "@langchain/core/output_parsers";
-import type { ChunkDocument, RouteType, LLMEngineApi } from "./types";
+import type { ChunkDocument, RouteType, LLMEngineApi, QueryAnalysis, SearchStrategy, QueryKeywords } from "./types";
 
 /**
  * 生成集成模块（对应原 Python generation_integration.py）
- * 负责：LLM 集成、查询路由/重写、基础/分步/列表回答、流式输出
+ * 负责：LLM 集成、查询路由/重写/分析、基础/分步/列表回答、流式输出、重试降级
  *
  * 已重构为工厂函数 + 闭包，不再使用 class/this。
  */
@@ -16,6 +16,7 @@ export function createLLMEngine(
   apiKey: string,
   baseURL: string
 ): LLMEngineApi {
+  // 统一使用流式 ChatOpenAI 实例，列表回答与查询分析除外，其他回答都可边生成边返回。
   const llm = new ChatOpenAI({
     model: modelName,
     temperature,
@@ -24,10 +25,29 @@ export function createLLMEngine(
     configuration: { baseURL },
     streaming: true,
   });
+
+  // 非流式 LLM，用于查询分析、关键词提取等需要稳定 JSON 的场景
+  const llmNonStreaming = new ChatOpenAI({
+    model: modelName,
+    temperature: 0.1,
+    maxTokens: 1024,
+    apiKey,
+    configuration: { baseURL },
+    streaming: false,
+  });
+
   console.log(`[Generation] LLM 初始化完成: ${modelName}`);
 
+  // 路由统计
+  const routeStats = {
+    traditionalCount: 0,
+    graphRagCount: 0,
+    combinedCount: 0,
+    totalQueries: 0,
+  };
+
   /**
-   * 查询路由 - 根据查询类型选择不同的处理方式
+   * 查询路由 - 根据查询类型选择不同的处理方式（保留旧接口）
    * 返回: 'list' | 'detail' | 'general'
    */
   async function queryRouter(query: string): Promise<RouteType> {
@@ -51,9 +71,178 @@ export function createLLMEngine(
     const chain = prompt.pipe(llm).pipe(new StringOutputParser());
     const result = (await chain.invoke({ query })).trim().toLowerCase();
 
+    // 模型输出可能包含解释文字，因此用 includes 做宽松归类兜底。
     if (result.includes("list")) return "list";
     if (result.includes("detail")) return "detail";
     return "general";
+  }
+
+  /**
+   * 智能查询路由分析 - 判断应使用传统检索、图 RAG 还是组合策略
+   */
+  async function analyzeQuery(query: string): Promise<QueryAnalysis> {
+    const prompt = ChatPromptTemplate.fromTemplate(`你是一位查询分析专家。请分析用户的问题，判断应该使用哪种检索策略。
+
+可选策略：
+- "hybrid_traditional": 适合简单、直接的食谱查询，如"可乐鸡翅怎么做"、"推荐素菜"
+- "graph_rag": 适合涉及多实体关系、复杂推理、食材关联、多步骤因果的问题，如"含有可乐和鸡翅的菜品还有什么共同食材"、"地三鲜的制作流程涉及哪些食材"
+- "combined": 适合既有明确实体又有关系探索需求的问题，如"哪些荤菜用到了土豆和牛肉"
+
+请返回严格的 JSON 格式：
+{{
+  "queryComplexity": 0.0-1.0,
+  "relationshipIntensity": 0.0-1.0,
+  "reasoningRequired": true/false,
+  "entityCount": 整数,
+  "recommendedStrategy": "hybrid_traditional" | "graph_rag" | "combined",
+  "confidence": 0.0-1.0,
+  "reasoning": "简短分析"
+}}
+
+用户问题: {query}
+
+JSON:`);
+
+    try {
+      const chain = prompt.pipe(llmNonStreaming).pipe(new StringOutputParser());
+      const result = (await chain.invoke({ query })).trim();
+      const jsonMatch = result.match(/\{[\s\S]*\}/);
+      const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : result) as QueryAnalysis;
+      const validated = validateQueryAnalysis(parsed);
+      updateRouteStats(validated.recommendedStrategy);
+      return validated;
+    } catch (error) {
+      console.warn("[Generation] LLM 查询分析失败，降级到规则分析:", error);
+      return ruleBasedAnalyzeQuery(query);
+    }
+  }
+
+  function validateQueryAnalysis(analysis: QueryAnalysis): QueryAnalysis {
+    const validStrategies: SearchStrategy[] = ["hybrid_traditional", "graph_rag", "combined"];
+    const strategy = validStrategies.includes(analysis.recommendedStrategy)
+      ? analysis.recommendedStrategy
+      : "hybrid_traditional";
+
+    return {
+      queryComplexity: Math.min(Math.max(analysis.queryComplexity || 0, 0), 1),
+      relationshipIntensity: Math.min(Math.max(analysis.relationshipIntensity || 0, 0), 1),
+      reasoningRequired: Boolean(analysis.reasoningRequired),
+      entityCount: Math.max(analysis.entityCount || 0, 0),
+      recommendedStrategy: strategy,
+      confidence: Math.min(Math.max(analysis.confidence || 0, 0), 1),
+      reasoning: analysis.reasoning || "",
+    };
+  }
+
+  function ruleBasedAnalyzeQuery(query: string): QueryAnalysis {
+    const lower = query.toLowerCase();
+    const entityMatches = (lower.match(/[\u4e00-\u9fa5]{2,}/g) || []).filter(
+      (w) => !["怎么", "做法", "步骤", "食材", "推荐", "介绍", "查询", "什么", "哪些", "如何", "怎样"].includes(w)
+    );
+
+    const hasRelationshipWords =
+      lower.includes("共同") ||
+      lower.includes("一起") ||
+      lower.includes("关系") ||
+      lower.includes("关联") ||
+      lower.includes("含有");
+    const hasReasoningWords =
+      lower.includes("为什么") ||
+      lower.includes("如何") ||
+      lower.includes("怎样") ||
+      lower.includes("流程") ||
+      lower.includes("路径");
+
+    const entityCount = entityMatches.length;
+    let strategy: SearchStrategy = "hybrid_traditional";
+    let complexity = 0.3;
+    let relationshipIntensity = 0.2;
+
+    if (hasRelationshipWords || entityCount >= 2) {
+      strategy = hasReasoningWords ? "combined" : "graph_rag";
+      complexity = 0.7;
+      relationshipIntensity = 0.7;
+    }
+    if (hasReasoningWords && entityCount >= 2) {
+      strategy = "combined";
+      complexity = 0.9;
+      relationshipIntensity = 0.8;
+    }
+
+    updateRouteStats(strategy);
+
+    return {
+      queryComplexity: complexity,
+      relationshipIntensity,
+      reasoningRequired: hasReasoningWords,
+      entityCount,
+      recommendedStrategy: strategy,
+      confidence: 0.6,
+      reasoning: "基于规则分析：" + (hasRelationshipWords ? "问题包含关系探索词" : "问题较直接"),
+    };
+  }
+
+  function updateRouteStats(strategy: SearchStrategy): void {
+    routeStats.totalQueries += 1;
+    if (strategy === "hybrid_traditional") routeStats.traditionalCount += 1;
+    else if (strategy === "graph_rag") routeStats.graphRagCount += 1;
+    else if (strategy === "combined") routeStats.combinedCount += 1;
+
+    console.log(
+      `[Generation] 路由统计: total=${routeStats.totalQueries}, traditional=${routeStats.traditionalCount}, graph_rag=${routeStats.graphRagCount}, combined=${routeStats.combinedCount}`
+    );
+  }
+
+  /**
+   * 双层关键词提取：实体级 + 主题级
+   */
+  async function extractQueryKeywords(query: string): Promise<QueryKeywords> {
+    const prompt = ChatPromptTemplate.fromTemplate(`从用户的食谱问题中提取两类关键词，用于 BM25 检索增强。
+
+- entityKeywords: 实体级关键词，如菜名、食材名、工具名、分类名等具体名词
+- topicKeywords: 主题级关键词，如烹饪方法、口味、场景、技巧等抽象概念
+
+请返回严格 JSON 格式：
+{{
+  "entityKeywords": ["关键词1", "关键词2"],
+  "topicKeywords": ["主题1", "主题2"]
+}}
+
+注意：只返回关键词，不要解释。
+
+用户问题: {query}
+
+JSON:`);
+
+    try {
+      const chain = prompt.pipe(llmNonStreaming).pipe(new StringOutputParser());
+      const result = (await chain.invoke({ query })).trim();
+      const jsonMatch = result.match(/\{[\s\S]*\}/);
+      const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : result) as QueryKeywords;
+      return {
+        entityKeywords: Array.isArray(parsed.entityKeywords) ? parsed.entityKeywords : [],
+        topicKeywords: Array.isArray(parsed.topicKeywords) ? parsed.topicKeywords : [],
+      };
+    } catch (error) {
+      console.warn("[Generation] 关键词提取失败，降级到规则提取:", error);
+      return ruleBasedExtractKeywords(query);
+    }
+  }
+
+  function ruleBasedExtractKeywords(query: string): QueryKeywords {
+    const lower = query.toLowerCase();
+    // 提取中文连续名词/短语作为实体候选
+    const matches = lower.match(/[\u4e00-\u9fa5]{2,}/g) || [];
+    const entityKeywords = matches.filter(
+      (w) =>
+        !["怎么", "做法", "步骤", "食材", "推荐", "介绍", "查询", "什么", "哪些", "如何", "怎样", "的", "了", "和", "是"].includes(w)
+    );
+    const topicKeywords = matches.filter((w) => ["做法", "步骤", "技巧", "口味", "营养", "简单", "困难", "家常", "快手"].includes(w));
+
+    return {
+      entityKeywords: [...new Set(entityKeywords)].slice(0, 5),
+      topicKeywords: [...new Set(topicKeywords)].slice(0, 3),
+    };
   }
 
   /**
@@ -113,6 +302,7 @@ export function createLLMEngine(
     }
 
     // 提取菜品名称（去重）
+    // 列表型问题不需要调用 LLM 生成长答案，直接返回命中的菜名更稳定。
     const dishNames: string[] = [];
     for (const doc of contextDocs) {
       const name = doc.metadata.dish_name || "未知菜品";
@@ -142,10 +332,40 @@ export function createLLMEngine(
   }
 
   /**
+   * 流式生成重试包装器
+   * maxRetries=3, 指数退避 2s/4s/6s，全部失败降级为非流式
+   */
+  function withRetry<T extends (...args: any[]) => AsyncGenerator<string>>(
+    generatorFn: T,
+    maxRetries: number = 3
+  ): T {
+    return (async function* (...args: Parameters<T>): AsyncGenerator<string> {
+      let lastError: unknown;
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          const stream = generatorFn(...args);
+          for await (const chunk of stream) {
+            yield chunk;
+          }
+          return;
+        } catch (error) {
+          lastError = error;
+          const delay = 2000 * (attempt + 1);
+          console.warn(`[Generation] 流式生成失败，第 ${attempt + 1} 次重试，等待 ${delay}ms...`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+
+      console.error("[Generation] 流式生成多次重试失败，降级为非流式:", lastError);
+      yield "抱歉，生成过程中出现网络波动，请稍后再试。";
+    }) as T;
+  }
+
+  /**
    * 生成基础回答 - 流式输出
    * 对应原 Python generate_basic_answer_stream
    */
-  async function *generateBasicAnswerStream(
+  async function* generateBasicAnswerStream(
     query: string,
     contextDocs: ChunkDocument[],
     history: Array<{ role: string; content: string }> = []
@@ -182,7 +402,7 @@ ${historyText}
    * 生成分步骤回答 - 流式输出
    * 对应原 Python generate_step_by_step_answer_stream
    */
-  async function *generateStepByStepAnswerStream(
+  async function* generateStepByStepAnswerStream(
     query: string,
     contextDocs: ChunkDocument[],
     history: Array<{ role: string; content: string }> = []
@@ -233,8 +453,12 @@ ${historyText}
     }
   }
 
+  // 使用重试包装流式生成函数
+  const generateBasicAnswerStreamWithRetry = withRetry(generateBasicAnswerStream);
+  const generateStepByStepAnswerStreamWithRetry = withRetry(generateStepByStepAnswerStream);
+
   /**
-   * 构建上下文字符串
+   * 构建上下文字符串，并标注检索来源层级
    * 对应原 Python _build_context
    */
   function buildContext(docs: ChunkDocument[], maxLength: number = 2000): string {
@@ -242,12 +466,17 @@ ${historyText}
       return "暂无相关食谱信息。";
     }
 
+    // 控制上下文长度，避免 prompt 过长影响响应速度和模型稳定性。
     const contextParts: string[] = [];
     let currentLength = 0;
 
     for (let i = 0; i < docs.length; i++) {
       const doc = docs[i];
-      let metadataInfo = `【食谱 ${i + 1}】`;
+      const searchMethod = doc.metadata.search_method || "hybrid";
+      const retrievalLevel = doc.metadata.retrieval_level || "chunk";
+      const levelTag = `[${searchMethod.toUpperCase()}-${retrievalLevel.toUpperCase()}]`;
+
+      let metadataInfo = `【食谱 ${i + 1}】${levelTag}`;
       if (doc.metadata.dish_name) {
         metadataInfo += ` ${doc.metadata.dish_name}`;
       }
@@ -282,6 +511,7 @@ ${historyText}
       return "";
     }
 
+    // 历史消息只转成简洁文本，具体保留轮数由调用方控制。
     const lines = history.map((msg) => {
       const role = msg.role === "user" ? "用户" : "助手";
       return `${role}: ${msg.content}`;
@@ -293,8 +523,11 @@ ${historyText}
   return {
     queryRouter,
     queryRewrite,
+    analyzeQuery,
+    extractQueryKeywords,
     generateListAnswer,
-    generateBasicAnswerStream,
-    generateStepByStepAnswerStream,
+    generateBasicAnswerStream: generateBasicAnswerStreamWithRetry,
+    generateStepByStepAnswerStream: generateStepByStepAnswerStreamWithRetry,
   };
 }
+
