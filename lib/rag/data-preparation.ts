@@ -1,14 +1,26 @@
 import { readdirSync, readFileSync, statSync } from "fs";
-import { join, relative, sep, parse } from "path";
-import type { ChunkDocument, ChunkMetadata, DataPreparationState, KnowledgeBaseStats } from "./types";
-import { CATEGORY_MAPPING, CATEGORY_LABELS, DIFFICULTY_LABELS } from "./config";
-import { md5, uuid, getProjectRoot } from "../utils";
+import { join, parse, relative, sep } from "path";
+import type {
+  ChunkDocument,
+  ChunkMetadata,
+  DataPreparationState,
+  KnowledgeBaseStats,
+} from "./types";
+import { CATEGORY_LABELS, CATEGORY_MAPPING, DIFFICULTY_LABELS } from "./config";
+import { getProjectRoot, md5, uuid, createLogger } from "../utils";
+
+const log = createLogger("DataPreparation");
 
 /**
- * 数据准备模块（对应原 Python data_preparation.py）
- * 负责：数据加载、元数据增强、Markdown 结构感知分块、父子文档映射
+ * 数据准备模块（对应原 Python data_preparation.py）。
  *
- * 已重构为工厂函数 + 状态对象，不再使用 class/this。
+ * RAG 的第一步是把原始知识库转换成适合检索的数据结构：
+ * 1. 递归读取 data/dishes 下的 Markdown 菜谱。
+ * 2. 根据目录、文件名、星级补充 category / dish_name / difficulty。
+ * 3. 按 Markdown 标题切成 child chunks，降低检索噪声。
+ * 4. 保存 child → parent 映射，命中片段后能回到完整菜谱。
+ *
+ * 这里使用工厂函数 + 闭包状态，不使用 class/this，方便在服务端单例中组合。
  */
 export function createDataPreparation(dataPath: string) {
   const state: DataPreparationState = {
@@ -18,31 +30,25 @@ export function createDataPreparation(dataPath: string) {
   };
 
   /**
-   * 加载所有 Markdown 文档
+   * 加载所有 Markdown 文档。
+   *
+   * 每个 Markdown 文件先作为 parent 文档保存。parent_id 使用相对路径 MD5，
+   * 因此只要文件路径不变，重启或重建索引后 ID 也保持一致。
    */
   function loadDocuments(): ChunkDocument[] {
-    console.log(`[DataPreparation] 正在从 ${dataPath} 加载文档...`);
+    log.info(`正在从 ${dataPath} 加载文档...`);
 
     const fullPath = join(getProjectRoot(), dataPath);
     const documents: ChunkDocument[] = [];
-
     const mdFiles = findMarkdownFiles(fullPath);
 
     for (const mdFile of mdFiles) {
       try {
         const content = readFileSync(mdFile, "utf-8");
+        const relativePath = relative(fullPath, mdFile).split(sep).join("/");
+        const parentId = md5(relativePath || mdFile.split(sep).join("/"));
 
-        // 生成确定性 parent_id（基于数据根目录的相对路径）
-        const dataRoot = fullPath;
-        let relativePath: string;
-        try {
-          relativePath = relative(dataRoot, mdFile).split(sep).join("/");
-        } catch {
-          relativePath = mdFile.split(sep).join("/");
-        }
-        const parentId = md5(relativePath);
-
-        const doc: ChunkDocument = {
+        documents.push({
           pageContent: content,
           metadata: {
             source: mdFile,
@@ -52,26 +58,25 @@ export function createDataPreparation(dataPath: string) {
             dish_name: "",
             difficulty: "未知",
           },
-        };
-
-        documents.push(doc);
+        });
       } catch (e) {
-        console.warn(`[DataPreparation] 读取文件 ${mdFile} 失败:`, e);
+        log.warn(`读取文件 ${mdFile} 失败:`, e);
       }
     }
 
-    // 增强元数据
     for (const doc of documents) {
       enhanceMetadata(doc);
     }
 
     state.documents = documents;
-    console.log(`[DataPreparation] 成功加载 ${documents.length} 个文档`);
+    log.info(`成功加载 ${documents.length} 个文档`);
     return documents;
   }
 
   /**
-   * 递归查找所有 .md 文件
+   * 递归查找所有 .md 文件。
+   *
+   * 数据目录按菜品分类组织，必须递归扫描才能收集全部菜谱。
    */
   function findMarkdownFiles(dir: string): string[] {
     const results: string[] = [];
@@ -94,13 +99,15 @@ export function createDataPreparation(dataPath: string) {
   }
 
   /**
-   * 增强文档元数据：提取分类、菜品名、难度
+   * 增强文档元数据：提取分类、菜品名、难度。
+   *
+   * 分类来自路径中的目录名，菜品名来自文件名，难度来自正文中的星级标记。
+   * 这些字段后续会用于检索过滤和来源展示。
    */
-  function enhanceMetadata(doc: ChunkDocument) {
+  function enhanceMetadata(doc: ChunkDocument): void {
     const filePath = doc.metadata.source;
     const pathParts = filePath.split(sep);
 
-    // 提取菜品分类
     doc.metadata.category = "其他";
     for (const [key, value] of Object.entries(CATEGORY_MAPPING)) {
       if (pathParts.includes(key)) {
@@ -109,11 +116,9 @@ export function createDataPreparation(dataPath: string) {
       }
     }
 
-    // 提取菜品名称（文件名，不含扩展名）
     doc.metadata.dish_name = parse(filePath).name;
-
-    // 分析难度等级（按 ★ 数量）
     const content = doc.pageContent;
+
     if (content.includes("★★★★★")) {
       doc.metadata.difficulty = "非常困难";
     } else if (content.includes("★★★★")) {
@@ -130,11 +135,13 @@ export function createDataPreparation(dataPath: string) {
   }
 
   /**
-   * Markdown 结构感知分块（对应原 Python _markdown_header_split）
-   * 按 #/##/### 标题分割，保留标题路径到 metadata
+   * Markdown 结构感知分块。
+   *
+   * 普通固定长度分块可能把“食材”和“步骤”切散；按标题分块更符合菜谱结构。
+   * 每个 child chunk 都会继承 parent 的菜品名、分类、难度等元数据。
    */
   function chunkDocuments(): ChunkDocument[] {
-    console.log("[DataPreparation] 正在进行 Markdown 结构感知分块...");
+    log.info("正在进行 Markdown 结构感知分块...");
 
     if (state.documents.length === 0) {
       throw new Error("请先加载文档");
@@ -145,13 +152,10 @@ export function createDataPreparation(dataPath: string) {
     for (const doc of state.documents) {
       try {
         const mdChunks = markdownHeaderSplit(doc);
-
         const parentId = doc.metadata.parent_id;
 
         mdChunks.forEach((chunk, i) => {
           const childId = uuid();
-
-          // 合并原文档元数据
           chunk.metadata = {
             ...doc.metadata,
             ...chunk.metadata,
@@ -162,14 +166,13 @@ export function createDataPreparation(dataPath: string) {
             batch_index: allChunks.length,
             chunk_size: chunk.pageContent.length,
           };
-
           state.parentChildMap[childId] = parentId;
         });
 
         allChunks.push(...mdChunks);
       } catch (e) {
-        console.warn(
-          `[DataPreparation] 文档 ${doc.metadata.dish_name} Markdown 分割失败:`,
+        log.warn(
+          `文档 ${doc.metadata.dish_name} Markdown 分割失败:`,
           e
         );
         allChunks.push(doc);
@@ -177,24 +180,22 @@ export function createDataPreparation(dataPath: string) {
     }
 
     state.chunks = allChunks;
-    console.log(
-      `[DataPreparation] Markdown 分块完成，共生成 ${allChunks.length} 个 chunk`
+    log.info(
+      `Markdown 分块完成，共生成 ${allChunks.length} 个 chunk`
     );
     return allChunks;
   }
 
   /**
-   * Markdown 标题分割器（自行实现，对应 Python MarkdownHeaderTextSplitter）
-   * 按 #/##/### 分割，strip_headers=false（保留标题）
+   * Markdown 标题分割器（对应 Python MarkdownHeaderTextSplitter）。
+   *
+   * 只按 #/##/### 分割，strip_headers=false（保留标题）。
+   * 保留标题能让 Embedding 和 LLM 同时看到当前片段所在章节，提高语义完整性。
    */
   function markdownHeaderSplit(doc: ChunkDocument): ChunkDocument[] {
     const content = doc.pageContent;
     const lines = content.split("\n");
-
-    // 标题正则：匹配 1-3 级标题
     const headerRegex = /^(#{1,3})\s+(.+)$/;
-
-    // 当前标题路径栈
     const headerStack: Array<{ level: number; text: string }> = [];
     const chunks: ChunkDocument[] = [];
 
@@ -202,19 +203,22 @@ export function createDataPreparation(dataPath: string) {
     let hasContent = false;
 
     const flushChunk = () => {
-      if (currentLines.length > 0 && hasContent) {
-        const pageContent = currentLines.join("\n").trim();
-        if (pageContent) {
-          const headerPath = headerStack.map((h) => h.text).join(" > ");
-          chunks.push({
-            pageContent,
-            metadata: {
-              ...doc.metadata,
-              header_path: headerPath || undefined,
-            } as ChunkMetadata,
-          });
-        }
+      if (currentLines.length === 0 || !hasContent) {
+        currentLines = [];
+        hasContent = false;
+        return;
       }
+
+      const pageContent = currentLines.join("\n").trim();
+      if (pageContent) {
+        const headerPath = headerStack.map((h) => h.text).join(" > ");
+        const metadata: ChunkMetadata = {
+          ...doc.metadata,
+          header_path: headerPath || undefined,
+        };
+        chunks.push({ pageContent, metadata });
+      }
+
       currentLines = [];
       hasContent = false;
     };
@@ -223,19 +227,18 @@ export function createDataPreparation(dataPath: string) {
       const match = line.match(headerRegex);
 
       if (match) {
-        // 遇到新标题，先保存当前 chunk
         flushChunk();
 
         const level = match[1].length;
         const text = match[2].trim();
-
-        // 更新标题栈：弹出级别 >= 当前的标题
-        while (headerStack.length > 0 && headerStack[headerStack.length - 1].level >= level) {
+        while (
+          headerStack.length > 0 &&
+          headerStack[headerStack.length - 1].level >= level
+        ) {
           headerStack.pop();
         }
         headerStack.push({ level, text });
 
-        // 标题行本身加入新 chunk（strip_headers=false）
         currentLines.push(line);
         hasContent = true;
       } else {
@@ -246,23 +249,21 @@ export function createDataPreparation(dataPath: string) {
       }
     }
 
-    // 保存最后一个 chunk
     flushChunk();
 
-    // 如果没有分割成功，将整个文档作为一个 chunk
     if (chunks.length === 0) {
-      chunks.push({
-        pageContent: content,
-        metadata: { ...doc.metadata } as ChunkMetadata,
-      });
+      const metadata: ChunkMetadata = { ...doc.metadata };
+      chunks.push({ pageContent: content, metadata });
     }
 
     return chunks;
   }
 
   /**
-   * 根据子块获取对应的父文档（智能去重，按相关性排序）
-   * 对应原 Python get_parent_documents
+   * 根据子块获取对应的父文档。
+   *
+   * 检索命中的是 child chunk，但生成回答通常需要完整菜谱，所以这里回溯 parent 文档。
+   * 同一个父文档被多个子块命中，说明整篇菜谱与问题更相关，会排在更前面。
    */
   function getParentDocuments(childChunks: ChunkDocument[]): ChunkDocument[] {
     const parentRelevance: Record<string, number> = {};
@@ -273,34 +274,26 @@ export function createDataPreparation(dataPath: string) {
       if (!parentId) continue;
 
       parentRelevance[parentId] = (parentRelevance[parentId] || 0) + 1;
-
       if (!parentDocsMap[parentId]) {
-        for (const doc of state.documents) {
-          if (doc.metadata.parent_id === parentId) {
-            parentDocsMap[parentId] = doc;
-            break;
-          }
+        const parent = state.documents.find(
+          (doc) => doc.metadata.parent_id === parentId
+        );
+        if (parent) {
+          parentDocsMap[parentId] = parent;
         }
       }
     }
 
-    // 按相关性排序（匹配次数多的排在前面）
-    const sortedParentIds = Object.entries(parentRelevance)
+    return Object.entries(parentRelevance)
       .sort(([, a], [, b]) => b - a)
-      .map(([id]) => id);
-
-    const parentDocs: ChunkDocument[] = [];
-    for (const parentId of sortedParentIds) {
-      if (parentDocsMap[parentId]) {
-        parentDocs.push(parentDocsMap[parentId]);
-      }
-    }
-
-    return parentDocs;
+      .map(([parentId]) => parentDocsMap[parentId])
+      .filter(Boolean);
   }
 
   /**
-   * 获取数据统计信息
+   * 获取数据统计信息。
+   *
+   * 统计信息主要用于知识库管理接口，帮助判断数据是否加载完整、分块是否合理。
    */
   function getStatistics(): KnowledgeBaseStats {
     if (state.documents.length === 0) {
@@ -327,7 +320,7 @@ export function createDataPreparation(dataPath: string) {
     const avgChunkSize =
       state.chunks.length > 0
         ? state.chunks.reduce(
-            (sum, c) => sum + (c.metadata.chunk_size || 0),
+            (sum, chunk) => sum + (chunk.metadata.chunk_size || 0),
             0
           ) / state.chunks.length
         : 0;
@@ -346,19 +339,19 @@ export function createDataPreparation(dataPath: string) {
     chunkDocuments,
     getParentDocuments,
     getStatistics,
-    /** 只读状态，外部组合时可用 */
+    /** 暴露只读状态，方便主编排模块在必要时查看 documents/chunks。 */
     get state() {
       return state;
     },
   };
 }
 
-/** 获取支持的分类标签 */
+/** 获取系统支持的分类标签，供查询过滤逻辑使用。 */
 export function getSupportedCategories(): string[] {
   return CATEGORY_LABELS;
 }
 
-/** 获取支持的难度标签 */
+/** 获取系统支持的难度标签，返回副本避免外部修改常量。 */
 export function getSupportedDifficulties(): string[] {
   return [...DIFFICULTY_LABELS];
 }

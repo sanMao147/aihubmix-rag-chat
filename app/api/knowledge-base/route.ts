@@ -13,22 +13,17 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   try {
     const config = loadConfig();
-    const indexExists = existsSync(join(process.cwd(), config.indexSavePath));
-
-    if (!indexExists) {
-      return NextResponse.json({
-        ready: false,
-        indexExists: false,
-        message: "知识库尚未构建",
-      });
-    }
+    const indexPath = join(process.cwd(), config.indexSavePath);
+    const hadIndex = existsSync(indexPath);
 
     const ragSystem = await getInitializedRAGSystem();
     const stats = ragSystem.getStats();
+    const indexExists = existsSync(indexPath);
 
     return NextResponse.json({
       ready: ragSystem.isReady(),
-      indexExists: true,
+      indexExists,
+      message: hadIndex ? "知识库已就绪" : "知识库已构建",
       stats,
     });
   } catch (error) {

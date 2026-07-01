@@ -24,17 +24,9 @@ import { ChatMessages } from "@/components/chat/chat-messages";
 import { ChatInput } from "@/components/chat/chat-input";
 
 export default function Home() {
-  const [sessions, setSessions] = useState<ChatSession[]>(() => loadSessions());
-  const [currentSessionId, setCurrentSession] = useState<string | null>(() => {
-    const loaded = loadSessions();
-    const id = getCurrentSessionId();
-    return id && loaded.find((s) => s.id === id) ? id : null;
-  });
-  const [messages, setMessages] = useState<ChatMessage[]>(() => {
-    const loaded = loadSessions();
-    const id = getCurrentSessionId();
-    return id ? loaded.find((s) => s.id === id)?.messages || [] : [];
-  });
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [currentSessionId, setCurrentSession] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [streamingMessage, setStreamingMessage] = useState<ChatMessage | null>(
     null
   );
@@ -44,9 +36,38 @@ export default function Home() {
   const [kbStatus, setKbStatus] = useState<{
     ready: boolean;
     loading: boolean;
+    message?: string;
   }>({ ready: false, loading: true });
 
   const abortControllerRef = useRef<AbortController | null>(null);
+  // 用 ref 跟踪 streamingMessage 的最新值，避免闭包捕获过期 state
+  const streamingMessageRef = useRef<ChatMessage | null>(null);
+  // 用 ref 跟踪当前 sessionId，避免闭包问题
+  const currentSessionIdRef = useRef<string | null>(null);
+
+  // localStorage 只能在浏览器挂载后读取，避免 SSR 首屏与客户端首屏不一致。
+  useEffect(() => {
+    let cancelled = false;
+
+    queueMicrotask(() => {
+      if (cancelled) return;
+
+      const loaded = loadSessions();
+      const storedId = getCurrentSessionId();
+      const validSession = storedId
+        ? loaded.find((session) => session.id === storedId)
+        : undefined;
+
+      setSessions(loaded);
+      setCurrentSession(validSession?.id ?? null);
+      setMessages(validSession?.messages ?? []);
+      currentSessionIdRef.current = validSession?.id ?? null;
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // 检查知识库状态
   useEffect(() => {
@@ -54,9 +75,22 @@ export default function Home() {
       try {
         const res = await fetch("/api/knowledge-base");
         const data = await res.json();
-        setKbStatus({ ready: data.ready, loading: false });
+        setKbStatus({
+          ready: data.ready,
+          loading: false,
+          message:
+            data.error ||
+            data.message ||
+            (data.indexExists === false
+              ? "知识库索引未构建，请确认 API Key 可用后重建知识库"
+              : undefined),
+        });
       } catch {
-        setKbStatus({ ready: false, loading: false });
+        setKbStatus({
+          ready: false,
+          loading: false,
+          message: "无法获取知识库状态，请确认开发服务正在运行",
+        });
       }
     }
     checkKnowledgeBase();
@@ -68,7 +102,7 @@ export default function Home() {
     return sessions.find((s) => s.id === currentSessionId) || null;
   }, [currentSessionId, sessions]);
 
-  // 更新会话
+  // 更新会话（通过 updater 函数）
   const updateSession = useCallback(
     (sessionId: string, updater: (s: ChatSession) => ChatSession) => {
       setSessions((prev) => {
@@ -82,31 +116,90 @@ export default function Home() {
     []
   );
 
+  // 直接用 messages 数组更新会话（用于 abort 后保存部分内容等场景）
+  const updateSessionById = useCallback(
+    (sessionId: string, messages: ChatMessage[]) => {
+      setSessions((prev) => {
+        const updated = prev.map((s) =>
+          s.id === sessionId
+            ? { ...s, messages, updatedAt: Date.now() }
+            : s
+        );
+        saveSessions(updated);
+        return updated;
+      });
+    },
+    []
+  );
+
   // 新建对话
   const handleNewChat = () => {
-    // 如果有正在流式输出的，先停止
+    // 如果有正在流式输出的，先停止并保存已输出的部分
     if (abortControllerRef.current) {
+      // 从 ref 读取最新值（避免闭包过期问题）
+      const latestStreamMsg = streamingMessageRef.current;
+      const latestSessionId = currentSessionIdRef.current;
+      if (latestStreamMsg && latestStreamMsg.content && latestSessionId) {
+        const partialMessage: ChatMessage = { ...latestStreamMsg };
+        // 直接通过 updateSessionById 保存（不走 setMessages，因为即将清空）
+        setSessions((prev) => {
+          const updated = prev.map((s) =>
+            s.id === latestSessionId
+              ? {
+                  ...s,
+                  messages: [...s.messages, partialMessage],
+                  updatedAt: Date.now(),
+                }
+              : s
+          );
+          saveSessions(updated);
+          return updated;
+        });
+      }
       abortControllerRef.current.abort();
     }
+    streamingMessageRef.current = null;
     setStreamingMessage(null);
     setIsStreaming(false);
     setIsThinking(false);
     setMessages([]);
     setCurrentSession(null);
     setCurrentSessionId("");
+    currentSessionIdRef.current = null;
     setSidebarOpen(false);
   };
 
   // 选择会话
   const handleSelectSession = (id: string) => {
+    // 如果有正在流式输出的，先停止并保存已输出的部分到当前会话
     if (abortControllerRef.current) {
+      const latestStreamMsg = streamingMessageRef.current;
+      const latestSessionId = currentSessionIdRef.current;
+      if (latestStreamMsg && latestStreamMsg.content && latestSessionId) {
+        const partialMessage: ChatMessage = { ...latestStreamMsg };
+        setSessions((prev) => {
+          const updated = prev.map((s) =>
+            s.id === latestSessionId
+              ? {
+                  ...s,
+                  messages: [...s.messages, partialMessage],
+                  updatedAt: Date.now(),
+                }
+              : s
+          );
+          saveSessions(updated);
+          return updated;
+        });
+      }
       abortControllerRef.current.abort();
     }
+    streamingMessageRef.current = null;
     setStreamingMessage(null);
     setIsStreaming(false);
     setIsThinking(false);
     setCurrentSession(id);
     setCurrentSessionId(id);
+    currentSessionIdRef.current = id;
     const session = sessions.find((s) => s.id === id);
     setMessages(session?.messages || []);
     setSidebarOpen(false);
@@ -141,19 +234,25 @@ export default function Home() {
     if (isStreaming) return;
 
     // 确保有当前会话
-    let sessionId: string = currentSessionId || "";
-    let session = sessionId ? getCurrentSession() : null;
+    const existingSession = getCurrentSession();
+    let session: ChatSession;
+    let sessionId: string;
 
-    if (!session) {
+    if (!existingSession) {
       session = createSession(generateTitle(text));
       sessionId = session.id;
       setCurrentSession(session.id);
       setCurrentSessionId(session.id);
+      currentSessionIdRef.current = session.id;
       setSessions((prev) => {
-        const updated = [session!, ...prev];
+        const updated = [session, ...prev];
         saveSessions(updated);
         return updated;
       });
+    } else {
+      session = existingSession;
+      sessionId = existingSession.id;
+      currentSessionIdRef.current = existingSession.id;
     }
 
     // 添加用户消息
@@ -186,6 +285,7 @@ export default function Home() {
       sources: [],
       createdAt: Date.now(),
     };
+    streamingMessageRef.current = streamMsg;
     setStreamingMessage(streamMsg);
 
     const controller = new AbortController();
@@ -234,23 +334,29 @@ export default function Home() {
             switch (event.type) {
               case "sources":
                 collectedSources.push(...event.data);
-                setStreamingMessage((prev) =>
-                  prev ? { ...prev, sources: event.data } : prev
-                );
+                setStreamingMessage((prev) => {
+                  const updated = prev ? { ...prev, sources: event.data } : prev;
+                  if (updated) streamingMessageRef.current = updated;
+                  return updated;
+                });
                 break;
 
               case "token":
                 fullContent += event.data;
-                setStreamingMessage((prev) =>
-                  prev ? { ...prev, content: fullContent } : prev
-                );
+                setStreamingMessage((prev) => {
+                  const updated = prev ? { ...prev, content: fullContent } : prev;
+                  if (updated) streamingMessageRef.current = updated;
+                  return updated;
+                });
                 break;
 
               case "error":
                 fullContent += `\n\n⚠️ 错误: ${event.data}`;
-                setStreamingMessage((prev) =>
-                  prev ? { ...prev, content: fullContent } : prev
-                );
+                setStreamingMessage((prev) => {
+                  const updated = prev ? { ...prev, content: fullContent } : prev;
+                  if (updated) streamingMessageRef.current = updated;
+                  return updated;
+                });
                 break;
 
               case "done":
@@ -271,6 +377,7 @@ export default function Home() {
 
       const updatedMessages = [...newMessages, finalMessage];
       setMessages(updatedMessages);
+      streamingMessageRef.current = null;
       setStreamingMessage(null);
 
       // 更新会话存储
@@ -281,15 +388,15 @@ export default function Home() {
       }));
     } catch (e) {
       if (e instanceof Error && e.name === "AbortError") {
-        // 用户主动停止
-        if (streamingMessage && streamingMessage.content) {
-          const finalMessage = { ...streamingMessage };
-          setMessages((prev) => [...prev, finalMessage]);
-          updateSession(sessionId, (s) => ({
-            ...s,
-            messages: [...messages, userMsg, finalMessage],
-            updatedAt: Date.now(),
-          }));
+        // 用户主动停止——从 ref 读取最新值，避免闭包过期
+        const latestStreamMsg = streamingMessageRef.current;
+        if (latestStreamMsg && latestStreamMsg.content) {
+          const finalMessage: ChatMessage = { ...latestStreamMsg };
+          setMessages((prev) => {
+            const updated = [...prev, finalMessage];
+            updateSessionById(sessionId, updated);
+            return updated;
+          });
         }
       } else {
         console.error("[Chat] 发送失败:", e);
@@ -297,13 +404,13 @@ export default function Home() {
           ...streamMsg,
           content: `⚠️ 发送失败: ${e instanceof Error ? e.message : "未知错误"}`,
         };
-        setMessages((prev) => [...prev, errorMsg]);
-        updateSession(sessionId, (s) => ({
-          ...s,
-          messages: [...messages, userMsg, errorMsg],
-          updatedAt: Date.now(),
-        }));
+        setMessages((prev) => {
+          const updated = [...prev, errorMsg];
+          updateSessionById(sessionId, updated);
+          return updated;
+        });
       }
+      streamingMessageRef.current = null;
       setStreamingMessage(null);
     } finally {
       setIsThinking(false);
@@ -360,7 +467,7 @@ export default function Home() {
         )}
         {!kbStatus.loading && !kbStatus.ready && (
           <div className="border-b border-amber-200/50 bg-amber-50/80 px-4 py-2 text-center text-xs text-amber-700 backdrop-blur-md">
-            知识库未就绪，请配置 AIHUBMIX_API_KEY 后重启服务
+            {kbStatus.message || "知识库未就绪，请检查 API Key 并重建知识库"}
           </div>
         )}
 

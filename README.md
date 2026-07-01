@@ -97,6 +97,66 @@ npm run dev
 └── .env.local                     # 环境变量
 ```
 
+## 🧠 整体架构思维导图
+
+```text
+尝尝咸淡 RAG 食谱助手
+├── 前端交互层
+│   ├── app/page.tsx
+│   │   └── 渲染聊天主页，承载输入框、消息列表和侧边栏
+│   ├── components/chat
+│   │   ├── 管理用户输入、消息展示、来源引用
+│   │   └── 通过 SSE 接收助手流式回复
+│   └── lib/store/chat-store.ts
+│       ├── localStorage 保存多会话历史
+│       └── 维护当前会话 ID、消息和标题
+├── API 层
+│   ├── app/api/chat/route.ts
+│   │   ├── 接收用户问题和历史上下文
+│   │   ├── 调用 RAG 系统 askQuestion
+│   │   └── 以 SSE 返回 sources、token、done/error
+│   └── app/api/knowledge-base/route.ts
+│       ├── 查询知识库统计
+│       └── 支持重置或重建知识库
+├── RAG 核心层（lib/rag）
+│   ├── rag-instance.ts
+│   │   └── 使用 globalThis 缓存服务端单例，避免重复初始化
+│   ├── rag-system.ts
+│   │   └── 编排 数据准备 → 索引构建 → 混合检索 → LLM 生成
+│   ├── config.ts
+│   │   └── 读取模型、路径、topK、温度、API Key 等配置
+│   ├── data-preparation.ts
+│   │   ├── 递归读取 data/dishes Markdown 菜谱
+│   │   ├── 从路径/文件名/星级抽取分类、菜名、难度
+│   │   └── 按 Markdown 标题分块，建立 child → parent 映射
+│   ├── index-construction.ts
+│   │   ├── 调用 Embedding 模型生成向量
+│   │   ├── 使用内存向量库做余弦相似度搜索
+│   │   └── 将向量和文档缓存到 .data/vector-store.json
+│   ├── retrieval.ts
+│   │   ├── 向量检索召回语义相似内容
+│   │   ├── BM25 召回关键词精确匹配内容
+│   │   ├── RRF 融合两路排名
+│   │   └── 按分类、难度等元数据过滤
+│   ├── generation.ts
+│   │   ├── LLM 判断问题类型：list / detail / general
+│   │   ├── 对非列表问题做查询重写
+│   │   ├── 列表问题直接生成菜名推荐
+│   │   └── 详细/一般问题基于检索上下文流式生成回答
+│   └── types.ts
+│       └── 统一定义文档、元数据、来源、SSE、模块 API 类型
+├── 数据层
+│   ├── data/dishes
+│   │   └── 323 个 Markdown 食谱，是 RAG 知识来源
+│   └── .data/vector-store.json
+│       └── 首次构建后生成的本地向量索引缓存
+└── 外部模型服务
+    ├── OpenAIEmbeddings / AIHubMix 兼容接口
+    │   └── 将菜谱 chunk 和用户查询转换成向量
+    └── ChatOpenAI / AIHubMix 兼容接口
+        └── 完成查询路由、查询重写和最终回答生成
+```
+
 ## 🔌 接口可扩展性
 
 系统通过环境变量配置 API，可无缝切换到其他兼容 OpenAI 的接口：

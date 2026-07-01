@@ -1,20 +1,27 @@
 import type { RAGConfig } from "./config";
-import type {
-  ChunkDocument,
-  SourceDoc,
-  RouteType,
-  RAGSystem,
-} from "./types";
 import { createDataPreparation, getSupportedCategories, getSupportedDifficulties } from "./data-preparation";
+import { createLLMEngine } from "./generation";
 import { createIndexBuilder } from "./index-construction";
 import { createRetrievalEngine } from "./retrieval";
-import { createLLMEngine } from "./generation";
+import type {
+  ChunkDocument,
+  ChunkMetadata,
+  RAGSystem,
+  RouteType,
+  SourceDoc,
+} from "./types";
+import { createLogger } from "../utils";
+
+const log = createLogger("RAGSystem");
 
 /**
- * RAG 系统主工厂函数（对应原 Python main.py RecipeRAGSystem）
- * 串联：数据准备 → 索引构建 → 检索优化 → 生成集成
+ * RAG 系统主工厂函数（对应原 Python main.py RecipeRAGSystem）。
  *
- * 已重构为工厂函数 + 闭包，不再使用 class/this。
+ * 这是 lib/rag 的总编排层，负责把四个模块串起来：
+ * 1. data-preparation：读取 Markdown、补元数据、分块。
+ * 2. index-construction：构建或加载向量索引。
+ * 3. retrieval：执行混合检索和过滤。
+ * 4. generation：查询路由、查询重写、流式回答。
  */
 export function createRAGSystem(config: RAGConfig): RAGSystem {
   let dataModule: ReturnType<typeof createDataPreparation> | null = null;
@@ -24,20 +31,21 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
   let initialized = false;
 
   /**
-   * 初始化所有模块
+   * 初始化各个模块。
+   *
+   * 这里只创建对象和 LLM/Embedding 客户端，不读取菜谱、不调用 Embedding API。
+   * 真正耗时的知识库构建放在 buildKnowledgeBase 中。
    */
   function initializeSystem(): void {
-    console.log("[RAGSystem] 正在初始化 RAG 系统...");
+    log.info("正在初始化 RAG 系统...");
 
     dataModule = createDataPreparation(config.dataPath);
-
     indexModule = createIndexBuilder(
       config.embeddingModel,
       config.indexSavePath,
-      config.apiKey,
-      config.baseURL
+      config.embeddingApiKey,
+      config.embeddingBaseURL
     );
-
     generationModule = createLLMEngine(
       config.llmModel,
       config.temperature,
@@ -47,65 +55,92 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
     );
 
     initialized = true;
-    console.log("[RAGSystem] 系统初始化完成");
+    log.info("系统初始化完成");
   }
 
   /**
-   * 构建知识库
-   * 对应原 Python build_knowledge_base
+   * 构建知识库。
+   *
+   * 优先加载本地缓存索引；如果缓存不存在、加载失败或 forceRebuild=true，
+   * 则重新读取菜谱、分块、向量化并保存索引。
+   * 缓存命中时，直接从索引恢复 chunks，跳过冗余的文档加载和分块 I/O。
    */
-  async function buildKnowledgeBase(forceRebuild: boolean = false): Promise<void> {
+  async function buildKnowledgeBase(
+    forceRebuild: boolean = false
+  ): Promise<void> {
     if (!initialized || !dataModule || !indexModule) {
       throw new Error("请先调用 initializeSystem()");
     }
 
-    console.log("[RAGSystem] 正在构建知识库...");
+    log.info("正在构建知识库...");
 
-    let vectorstore = null;
-
-    // 1. 尝试加载已保存的索引（非强制重建时）
+    let vectorstore: Awaited<ReturnType<typeof indexModule.loadIndex>> = null;
     if (!forceRebuild) {
       vectorstore = await indexModule.loadIndex();
     }
 
+    let chunks: ChunkDocument[];
+
     if (vectorstore) {
-      console.log("[RAGSystem] 成功加载已保存的向量索引");
-      // 仍需加载文档和分块用于检索模块
-      dataModule.loadDocuments();
-      const chunks = dataModule.chunkDocuments();
-
-      // 重建检索器
-      retrievalModule = createRetrievalEngine(vectorstore, chunks);
+      // 缓存命中：优先使用从索引恢复的 chunks
+      const cachedChunks = indexModule.getCachedChunks();
+      if (cachedChunks.length > 0) {
+        chunks = cachedChunks;
+        log.info(
+          `使用缓存的 ${chunks.length} 个 chunks，跳过文档加载和分块`
+        );
+      } else {
+        // 兼容旧版索引（无 chunks 缓存），回退到读取文档
+        log.info("旧版索引无 chunks 缓存，回退到文档加载...");
+        dataModule.loadDocuments();
+        chunks = dataModule.chunkDocuments();
+      }
     } else {
-      console.log("[RAGSystem] 未找到已保存的索引，开始构建新索引...");
-
-      // 2. 加载文档
+      log.info("未找到已保存的索引，开始构建新索引...");
       dataModule.loadDocuments();
-
-      // 3. 文本分块
-      const chunks = dataModule.chunkDocuments();
-
-      // 4. 构建向量索引
-      vectorstore = await indexModule.buildVectorIndex(chunks);
-
-      // 5. 保存索引
-      await indexModule.saveIndex(vectorstore);
-
-      // 6. 初始化检索模块
-      retrievalModule = createRetrievalEngine(vectorstore, chunks);
+      chunks = dataModule.chunkDocuments();
+      if (forceRebuild || config.autoBuildVectorIndex) {
+        try {
+          vectorstore = await indexModule.buildVectorIndex(chunks);
+          await indexModule.saveIndex(vectorstore);
+        } catch (error) {
+          log.warn(
+            "向量索引构建失败，已降级为 BM25 检索。请检查 Embedding API Key / Base URL / 模型配置。",
+            error
+          );
+          vectorstore = null;
+        }
+      } else {
+        log.info("已跳过自动向量索引构建，使用 BM25 检索快速启动知识库");
+      }
     }
 
-    // 7. 显示统计信息
-    const stats = dataModule.getStatistics();
-    console.log("[RAGSystem] 知识库统计:", stats);
-    console.log("[RAGSystem] 知识库构建完成");
+    retrievalModule = createRetrievalEngine(vectorstore, chunks);
+
+    // 统计信息在缓存命中时仍可通过 dataModule 获取（如果 loadDocuments 未被调用则可能为空）
+    const stats = indexModule.getCachedChunks().length > 0
+      ? {
+          total_documents: 0,
+          total_chunks: indexModule.getCachedChunks().length,
+          categories: {} as Record<string, number>,
+          difficulties: {} as Record<string, number>,
+          avg_chunk_size: 0,
+        }
+      : dataModule.getStatistics();
+    log.info("知识库统计:", stats);
+    log.info("知识库构建完成");
   }
 
   /**
-   * 回答用户问题（流式）
-   * 对应原 Python ask_question
+   * 回答用户问题（流式）。
    *
-   * @returns 包含来源文档和流式回答生成器的对象
+   * 完整链路：
+   * 1. LLM 判断问题类型。
+   * 2. 非列表问题进行查询重写。
+   * 3. 从问题中提取分类/难度过滤条件。
+   * 4. 混合检索 child chunks。
+   * 5. 回溯 parent 文档给 LLM 生成答案。
+   * 6. 返回 sources 和 AsyncGenerator，route handler 负责转成 SSE。
    */
   async function askQuestion(
     question: string,
@@ -115,33 +150,30 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
     routeType: RouteType;
     stream: AsyncGenerator<string>;
   }> {
-    if (
-      !retrievalModule ||
-      !generationModule ||
-      !dataModule
-    ) {
+    if (!retrievalModule || !generationModule || !dataModule) {
       throw new Error("请先构建知识库");
     }
 
-    console.log(`[RAGSystem] 用户问题: ${question}`);
+    log.info(`用户问题: ${question}`);
 
-    // 1. 查询路由
-    const routeType = await generationModule.queryRouter(question);
-    console.log(`[RAGSystem] 查询类型: ${routeType}`);
+    const routeType = await resolveRouteType(question);
+    log.info(`查询类型: ${routeType}`);
 
-    // 2. 智能查询重写（根据路由类型）
     let rewrittenQuery = question;
-    if (routeType !== "list") {
-      console.log("[RAGSystem] 智能分析查询...");
-      rewrittenQuery = await generationModule.queryRewrite(question);
+    if (routeType === "general") {
+      log.info("智能分析查询...");
+      try {
+        rewrittenQuery = await generationModule.queryRewrite(question);
+      } catch (error) {
+        log.warn("查询重写失败，使用原始问题继续检索。", error);
+      }
     }
 
-    // 3. 检索相关子块（自动应用元数据过滤）
     const filters = extractFiltersFromQuery(question);
     let relevantChunks: ChunkDocument[];
 
     if (Object.keys(filters).length > 0) {
-      console.log("[RAGSystem] 应用过滤条件:", filters);
+      log.info("应用过滤条件:", filters);
       relevantChunks = await retrievalModule.metadataFilteredSearch(
         rewrittenQuery,
         filters,
@@ -154,11 +186,8 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
       );
     }
 
-    console.log(
-      `[RAGSystem] 找到 ${relevantChunks.length} 个相关文档块`
-    );
+    log.info(`找到 ${relevantChunks.length} 个相关文档块`);
 
-    // 4. 检查是否找到相关内容
     if (relevantChunks.length === 0) {
       return {
         sources: [],
@@ -169,72 +198,39 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
       };
     }
 
-    // 5. 获取父文档
     const relevantDocs = dataModule.getParentDocuments(relevantChunks);
-
-    // 6. 构建来源文档信息
-    const sources: SourceDoc[] = relevantChunks.map((chunk) => ({
-      dish_name: chunk.metadata.dish_name || "未知菜品",
-      category: chunk.metadata.category || "未知",
-      difficulty: chunk.metadata.difficulty || "未知",
-      rrf_score: chunk.metadata.rrf_score || 0,
-      source: chunk.metadata.source || "",
-    }));
-
-    // 去重来源（按菜品名）
-    const uniqueSources = sources.filter(
-      (s, i, arr) => arr.findIndex((x) => x.dish_name === s.dish_name) === i
+    const sources = buildUniqueSources(relevantChunks);
+    const stream = buildAnswerStream(
+      routeType,
+      question,
+      relevantDocs,
+      history
     );
 
-    // 7. 根据路由类型选择回答方式
-    let stream: AsyncGenerator<string>;
-
-    if (routeType === "list") {
-      // 列表查询：直接返回菜品名称列表
-      const result = generationModule.generateListAnswer(
-        question,
-        relevantDocs
-      );
-      stream = (async function* () {
-        yield result.content;
-      })();
-    } else if (routeType === "detail") {
-      // 详细查询：分步指导模式
-      stream = generationModule.generateStepByStepAnswerStream(
-        question,
-        relevantDocs,
-        history
-      );
-    } else {
-      // 一般查询：基础回答模式
-      stream = generationModule.generateBasicAnswerStream(
-        question,
-        relevantDocs,
-        history
-      );
-    }
-
-    return { sources: uniqueSources, routeType, stream };
+    return { sources, routeType, stream };
   }
 
   /**
-   * 从用户问题中提取元数据过滤条件
-   * 对应原 Python _extract_filters_from_query
+   * 从用户问题中提取元数据过滤条件。
+   *
+   * 例如“推荐简单素菜”会提取 category=素菜、difficulty=简单。
+   * 难度按长度降序匹配，避免“非常简单”被提前识别成“简单”。
    */
-  function extractFiltersFromQuery(query: string): Record<string, string> {
-    const filters: Record<string, string> = {};
+  function extractFiltersFromQuery(
+    query: string
+  ): Partial<Record<keyof ChunkMetadata, string>> {
+    const filters: Partial<Record<keyof ChunkMetadata, string>> = {};
 
-    // 分类关键词
-    const categoryKeywords = getSupportedCategories();
-    for (const cat of categoryKeywords) {
+    for (const cat of getSupportedCategories()) {
       if (query.includes(cat)) {
         filters.category = cat;
         break;
       }
     }
 
-    // 难度关键词（按长度降序匹配，避免"简单"匹配到"非常简单"）
-    const difficultyKeywords = getSupportedDifficulties().sort((a, b) => b.length - a.length);
+    const difficultyKeywords = getSupportedDifficulties().sort(
+      (a, b) => b.length - a.length
+    );
     for (const diff of difficultyKeywords) {
       if (query.includes(diff)) {
         filters.difficulty = diff;
@@ -245,9 +241,107 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
     return filters;
   }
 
-  /**
-   * 获取知识库统计信息
-   */
+  async function resolveRouteType(query: string): Promise<RouteType> {
+    const localRoute = inferRouteType(query);
+    if (localRoute !== "general") {
+      return localRoute;
+    }
+
+    if (!generationModule) {
+      return "general";
+    }
+
+    try {
+      return await generationModule.queryRouter(query);
+    } catch (error) {
+      log.warn("查询分类失败，已降级为 general。", error);
+      return "general";
+    }
+  }
+
+  function inferRouteType(query: string): RouteType {
+    const detailKeywords = [
+      "怎么做",
+      "做法",
+      "步骤",
+      "食材",
+      "需要什么",
+      "制作",
+      "如何",
+      "教我",
+      "菜谱",
+    ];
+    if (detailKeywords.some((keyword) => query.includes(keyword))) {
+      return "detail";
+    }
+
+    const listKeywords = [
+      "推荐",
+      "有什么",
+      "哪些",
+      "几个",
+      "列表",
+      "菜品",
+      "想吃",
+      "吃什么",
+    ];
+    if (listKeywords.some((keyword) => query.includes(keyword))) {
+      return "list";
+    }
+
+    return "general";
+  }
+
+  /** 把检索到的 chunks 转换成前端展示用的来源列表，并按菜品名去重。 */
+  function buildUniqueSources(chunks: ChunkDocument[]): SourceDoc[] {
+    const sources: SourceDoc[] = chunks.map((chunk) => ({
+      dish_name: chunk.metadata.dish_name || "未知菜品",
+      category: chunk.metadata.category || "未知",
+      difficulty: chunk.metadata.difficulty || "未知",
+      rrf_score: chunk.metadata.rrf_score || 0,
+      source: chunk.metadata.source || "",
+    }));
+
+    return sources.filter(
+      (source, index, arr) =>
+        arr.findIndex((item) => item.dish_name === source.dish_name) === index
+    );
+  }
+
+  /** 根据路由类型选择合适的回答生成方式。 */
+  function buildAnswerStream(
+    routeType: RouteType,
+    question: string,
+    relevantDocs: ChunkDocument[],
+    history: Array<{ role: string; content: string }>
+  ): AsyncGenerator<string> {
+    if (!generationModule) {
+      throw new Error("生成模块未初始化");
+    }
+
+    if (routeType === "list") {
+      const result = generationModule.generateListAnswer(question, relevantDocs);
+      return (async function* () {
+        yield result.content;
+      })();
+    }
+
+    if (routeType === "detail") {
+      return generationModule.generateStepByStepAnswerStream(
+        question,
+        relevantDocs,
+        history
+      );
+    }
+
+    return generationModule.generateBasicAnswerStream(
+      question,
+      relevantDocs,
+      history
+    );
+  }
+
+  /** 获取知识库统计信息；未初始化时返回 null。 */
   function getStats() {
     if (!dataModule) {
       return null;
@@ -255,15 +349,9 @@ export function createRAGSystem(config: RAGConfig): RAGSystem {
     return dataModule.getStatistics();
   }
 
-  /**
-   * 检查知识库是否已就绪
-   */
+  /** 判断系统是否已经初始化并完成知识库构建。 */
   function isReady(): boolean {
-    return (
-      initialized &&
-      retrievalModule !== null &&
-      generationModule !== null
-    );
+    return initialized && retrievalModule !== null && generationModule !== null;
   }
 
   return {

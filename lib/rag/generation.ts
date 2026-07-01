@@ -1,13 +1,19 @@
-import { ChatOpenAI } from "@langchain/openai";
-import { ChatPromptTemplate, PromptTemplate } from "@langchain/core/prompts";
 import { StringOutputParser } from "@langchain/core/output_parsers";
-import type { ChunkDocument, RouteType, LLMEngineApi } from "./types";
+import { ChatPromptTemplate, PromptTemplate } from "@langchain/core/prompts";
+import { ChatOpenAI } from "@langchain/openai";
+import type { ChunkDocument, LLMEngineApi, RouteType } from "./types";
+import { createLogger } from "../utils";
+
+const log = createLogger("Generation");
 
 /**
- * 生成集成模块（对应原 Python generation_integration.py）
- * 负责：LLM 集成、查询路由/重写、基础/分步/列表回答、流式输出
+ * 生成集成模块（对应原 Python generation_integration.py）。
  *
- * 已重构为工厂函数 + 闭包，不再使用 class/this。
+ * 它负责所有“需要大模型理解或生成”的步骤：
+ * - queryRouter：判断用户是要列表、详细做法还是一般问答。
+ * - queryRewrite：把模糊问题改写成更适合检索的查询。
+ * - generateListAnswer：推荐类问题直接拼列表，不额外调用 LLM。
+ * - generate*Stream：把检索上下文和历史对话交给 LLM，流式生成回答。
  */
 export function createLLMEngine(
   modelName: string,
@@ -24,11 +30,15 @@ export function createLLMEngine(
     configuration: { baseURL },
     streaming: true,
   });
-  console.log(`[Generation] LLM 初始化完成: ${modelName}`);
+  log.info(`LLM 初始化完成: ${modelName}`);
 
   /**
-   * 查询路由 - 根据查询类型选择不同的处理方式
-   * 返回: 'list' | 'detail' | 'general'
+   * 查询路由。
+   *
+   * 路由结果决定后续生成策略：
+   * - list：用户要推荐或列表，直接输出菜名列表。
+   * - detail：用户要做法、步骤、食材，走分步指导 Prompt。
+   * - general：其他问题，走普通问答 Prompt。
    */
   async function queryRouter(query: string): Promise<RouteType> {
     const prompt = ChatPromptTemplate.fromTemplate(`根据用户的问题，将其分类为以下三种类型之一：
@@ -57,7 +67,10 @@ export function createLLMEngine(
   }
 
   /**
-   * 智能查询重写 - 让大模型判断是否需要重写查询
+   * 智能查询重写。
+   *
+   * RAG 检索依赖 query 与知识库文本的语义匹配。过短或过口语的问题可能召回不稳，
+   * 所以这里让 LLM 在保留原意的前提下补充“家常菜谱、制作方法”等检索友好词。
    */
   async function queryRewrite(query: string): Promise<string> {
     const prompt = PromptTemplate.fromTemplate(`你是一个智能查询分析助手。请分析用户的查询，判断是否需要重写以提高食谱搜索效果。
@@ -95,24 +108,26 @@ export function createLLMEngine(
     const response = (await chain.invoke({ query })).trim();
 
     if (response !== query) {
-      console.log(`[Generation] 查询已重写: '${query}' → '${response}'`);
+      log.info(`查询已重写: '${query}' → '${response}'`);
     }
 
     return response;
   }
 
   /**
-   * 生成列表式回答 - 适用于推荐类查询
+   * 生成列表式回答。
+   *
+   * 推荐类问题不需要 LLM 再生成长文本，直接从检索到的父文档中提取菜名即可。
+   * 这样速度更快，也能减少模型自由发挥。
    */
   function generateListAnswer(
-    query: string,
+    _query: string,
     contextDocs: ChunkDocument[]
   ): { content: string; isList: true } {
     if (contextDocs.length === 0) {
       return { content: "抱歉，没有找到相关的菜品信息。", isList: true };
     }
 
-    // 提取菜品名称（去重）
     const dishNames: string[] = [];
     for (const doc of contextDocs) {
       const name = doc.metadata.dish_name || "未知菜品";
@@ -121,38 +136,29 @@ export function createLLMEngine(
       }
     }
 
-    let content: string;
     if (dishNames.length === 1) {
-      content = `为您推荐：${dishNames[0]}`;
-    } else if (dishNames.length <= 3) {
-      content =
-        `为您推荐以下菜品：\n` +
-        dishNames.map((name, i) => `${i + 1}. ${name}`).join("\n");
-    } else {
-      content =
-        `为您推荐以下菜品：\n` +
-        dishNames
-          .slice(0, 3)
-          .map((name, i) => `${i + 1}. ${name}`)
-          .join("\n") +
-        `\n\n还有其他 ${dishNames.length - 3} 道菜品可供选择。`;
+      return { content: `为您推荐：${dishNames[0]}`, isList: true };
     }
+
+    const visibleNames = dishNames.slice(0, 3);
+    const content =
+      `为您推荐以下菜品：\n` +
+      visibleNames.map((name, i) => `${i + 1}. ${name}`).join("\n") +
+      (dishNames.length > 3
+        ? `\n\n还有其他 ${dishNames.length - 3} 道菜品可供选择。`
+        : "");
 
     return { content, isList: true };
   }
 
-  /**
-   * 生成基础回答 - 流式输出
-   * 对应原 Python generate_basic_answer_stream
-   */
-  async function *generateBasicAnswerStream(
+  /** 基础回答：适合技巧、概念、食材等一般问题。 */
+  async function* generateBasicAnswerStream(
     query: string,
     contextDocs: ChunkDocument[],
     history: Array<{ role: string; content: string }> = []
   ): AsyncGenerator<string> {
     const context = buildContext(contextDocs);
     const historyText = buildHistory(history);
-
     const prompt = ChatPromptTemplate.fromTemplate(`你是一位专业的烹饪助手。请根据以下食谱信息回答用户的问题。
 
 ${historyText}
@@ -167,29 +173,21 @@ ${historyText}
 回答:`);
 
     const chain = prompt.pipe(llm).pipe(new StringOutputParser());
-
-    const stream = await chain.stream({
-      question: query,
-      context,
-    });
+    const stream = await chain.stream({ question: query, context });
 
     for await (const chunk of stream) {
       yield chunk;
     }
   }
 
-  /**
-   * 生成分步骤回答 - 流式输出
-   * 对应原 Python generate_step_by_step_answer_stream
-   */
-  async function *generateStepByStepAnswerStream(
+  /** 分步骤回答：适合“怎么做、步骤、需要什么食材”这类详细制作问题。 */
+  async function* generateStepByStepAnswerStream(
     query: string,
     contextDocs: ChunkDocument[],
     history: Array<{ role: string; content: string }> = []
   ): AsyncGenerator<string> {
     const context = buildContext(contextDocs);
     const historyText = buildHistory(history);
-
     const prompt = ChatPromptTemplate.fromTemplate(`你是一位专业的烹饪导师。请根据食谱信息，为用户提供详细的分步骤指导。
 
 ${historyText}
@@ -222,11 +220,7 @@ ${historyText}
 回答:`);
 
     const chain = prompt.pipe(llm).pipe(new StringOutputParser());
-
-    const stream = await chain.stream({
-      question: query,
-      context,
-    });
+    const stream = await chain.stream({ question: query, context });
 
     for await (const chunk of stream) {
       yield chunk;
@@ -234,10 +228,15 @@ ${historyText}
   }
 
   /**
-   * 构建上下文字符串
-   * 对应原 Python _build_context
+   * 构建 LLM 上下文字符串。
+   *
+   * 把多个候选父文档合并为一段带元数据的文本，并用 maxLength 控制长度，
+   * 防止把过多菜谱塞进 Prompt 导致 token 超限。
    */
-  function buildContext(docs: ChunkDocument[], maxLength: number = 2000): string {
+  function buildContext(
+    docs: ChunkDocument[],
+    maxLength: number = 4000
+  ): string {
     if (docs.length === 0) {
       return "暂无相关食谱信息。";
     }
@@ -248,6 +247,7 @@ ${historyText}
     for (let i = 0; i < docs.length; i++) {
       const doc = docs[i];
       let metadataInfo = `【食谱 ${i + 1}】`;
+
       if (doc.metadata.dish_name) {
         metadataInfo += ` ${doc.metadata.dish_name}`;
       }
@@ -259,7 +259,6 @@ ${historyText}
       }
 
       const docText = `${metadataInfo}\n${doc.pageContent}\n`;
-
       if (currentLength + docText.length > maxLength) {
         break;
       }
@@ -269,11 +268,13 @@ ${historyText}
     }
 
     const divider = "\n" + "=".repeat(50) + "\n";
-    return divider + contextParts.join(divider);
+    return contextParts.join(divider);
   }
 
   /**
-   * 构建对话历史文本
+   * 构建多轮对话历史。
+   *
+   * route handler 会传入最近若干轮消息；这里转换成 Prompt 中更自然的中文角色标签。
    */
   function buildHistory(
     history: Array<{ role: string; content: string }>

@@ -41,10 +41,10 @@ export function ChatMessages({
             尝尝咸淡 RAG 食谱助手
           </h1>
           <p className="mb-1 text-slate-500">
-            解决您的选择困难症，告别"今天吃什么"的世纪难题
+            解决您的选择困难症，告别&quot;今天吃什么&quot;的世纪难题
           </p>
           <p className="text-sm text-slate-400">
-            试试问："推荐几个简单的素菜" 或 "可乐鸡翅怎么做"
+            试试问：&quot;推荐几个简单的素菜&quot; 或 &quot;可乐鸡翅怎么做&quot;
           </p>
         </div>
       </div>

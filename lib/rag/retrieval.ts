@@ -1,56 +1,72 @@
 import { BM25Retriever } from "@langchain/community/retrievers/bm25";
 import type { Document } from "@langchain/core/documents";
 import type { ChunkDocument, ChunkMetadata, RetrievalEngineApi } from "./types";
-import { md5 } from "../utils";
+import { createLogger } from "../utils";
 
-/** 向量存储接口（duck typing，只需有 similaritySearch 方法） */
+const log = createLogger("Retrieval");
+
+/** 向量存储接口：只要对象提供 similaritySearch，就可以接入检索引擎。 */
 interface VectorStoreLike {
   similaritySearch(query: string, k?: number): Promise<Document[]>;
 }
 
 /**
- * 检索优化模块（对应原 Python retrieval_optimization.py）
- * 负责：向量+BM25 混合检索、RRF 重排、元数据过滤
+ * 获取文档唯一标识：优先使用 chunk_id（更精确），不存在时回退到内容 MD5。
+ */
+function getDocId(doc: ChunkDocument): string {
+  return doc.metadata.chunk_id || `${doc.metadata.source}:${doc.metadata.chunk_index ?? doc.pageContent.length}`;
+}
+
+/**
+ * 检索优化模块（对应原 Python retrieval_optimization.py）。
  *
- * 已重构为工厂函数 + 闭包，不再使用 class/this。
+ * 这里把两类检索结果融合：
+ * - 向量检索：擅长语义相似，例如“下饭菜”和“家常肉菜”。
+ * - BM25：擅长关键词精确匹配，例如具体菜名、食材名。
+ *
+ * 两者结果再通过 RRF 重排，降低单一检索策略漏召回的风险。
  */
 export function createRetrievalEngine(
-  vectorstore: VectorStoreLike,
+  vectorstore: VectorStoreLike | null,
   chunks: ChunkDocument[]
 ): RetrievalEngineApi {
   const bm25Retriever = BM25Retriever.fromDocuments(chunks, { k: 5 });
-  console.log("[Retrieval] 检索器设置完成");
+  log.info(
+    vectorstore
+      ? "检索器设置完成"
+      : "检索器设置完成（Embedding 不可用，已降级为 BM25 检索）"
+  );
 
   /**
-   * 混合检索 - 结合向量检索和 BM25 检索，使用 RRF 重排
-   * 对应原 Python hybrid_search
+   * 混合检索。
+   *
+   * 先分别取向量 Top5 和 BM25 Top5，再用 RRF 融合排名，最后截取 topK。
    */
-  async function hybridSearch(query: string, topK: number = 3): Promise<ChunkDocument[]> {
-    // 向量检索
-    const vectorDocs = (await vectorstore.similaritySearch(query, 5)) as ChunkDocument[];
-
-    // BM25 检索
+  async function hybridSearch(
+    query: string,
+    topK: number = 3
+  ): Promise<ChunkDocument[]> {
+    const vectorDocs = vectorstore
+      ? ((await vectorstore.similaritySearch(query, 5)) as ChunkDocument[])
+      : [];
     const bm25Docs = (await bm25Retriever.invoke(query)) as ChunkDocument[];
-
-    // RRF 重排
     const rerankedDocs = rrfRerank(vectorDocs, bm25Docs);
     return rerankedDocs.slice(0, topK);
   }
 
   /**
-   * 带元数据过滤的检索
-   * 对应原 Python metadata_filtered_search
+   * 带元数据过滤的检索。
+   *
+   * 先扩大候选集，再按 category / difficulty 等字段过滤，避免过滤后结果太少。
    */
   async function metadataFilteredSearch(
     query: string,
     filters: Partial<Record<keyof ChunkMetadata, string>>,
     topK: number = 5
   ): Promise<ChunkDocument[]> {
-    // 先混合检索，获取更多候选
     const docs = await hybridSearch(query, topK * 3);
-
-    // 应用元数据过滤
     const filteredDocs: ChunkDocument[] = [];
+
     for (const doc of docs) {
       let match = true;
       for (const [key, value] of Object.entries(filters)) {
@@ -60,21 +76,32 @@ export function createRetrievalEngine(
           break;
         }
       }
+
       if (match) {
         filteredDocs.push(doc);
         if (filteredDocs.length >= topK) break;
       }
     }
 
-    return filteredDocs;
+    if (filteredDocs.length > 0) {
+      return filteredDocs;
+    }
+
+    const fallbackDocs = chunks.filter((doc) =>
+      Object.entries(filters).every(([key, value]) => {
+        const docValue = doc.metadata[key as keyof ChunkMetadata];
+        return docValue === value;
+      })
+    );
+
+    return fallbackDocs.slice(0, topK);
   }
 
   /**
-   * RRF (Reciprocal Rank Fusion) 重排算法
-   * 对应原 Python _rrf_rerank
+   * RRF (Reciprocal Rank Fusion) 重排算法。
    *
-   * 公式: score = 1 / (k + rank + 1)
-   * k=60 用于平滑排名
+   * 公式：score = 1 / (k + rank + 1)
+   * rank 越靠前，贡献越高；k=60 用于平滑，避免某一路检索的第一名过度压制其他结果。
    */
   function rrfRerank(
     vectorDocs: ChunkDocument[],
@@ -84,34 +111,30 @@ export function createRetrievalEngine(
     const docScores: Record<string, number> = {};
     const docObjects: Record<string, ChunkDocument> = {};
 
-    // 计算向量检索结果的 RRF 分数
     vectorDocs.forEach((doc, rank) => {
-      const docId = md5(doc.pageContent);
+      const docId = getDocId(doc);
       docObjects[docId] = doc;
-      const rrfScore = 1.0 / (k + rank + 1);
+      const rrfScore = 1 / (k + rank + 1);
       docScores[docId] = (docScores[docId] || 0) + rrfScore;
     });
 
-    // 计算 BM25 检索结果的 RRF 分数
     bm25Docs.forEach((doc, rank) => {
-      const docId = md5(doc.pageContent);
+      const docId = getDocId(doc);
       docObjects[docId] = doc;
-      const rrfScore = 1.0 / (k + rank + 1);
+      const rrfScore = 1 / (k + rank + 1);
       docScores[docId] = (docScores[docId] || 0) + rrfScore;
     });
 
-    // 按最终 RRF 分数排序
     const sortedDocs = Object.entries(docScores)
       .sort(([, a], [, b]) => b - a)
       .map(([docId, finalScore]) => {
         const doc = docObjects[docId];
-        // 将 RRF 分数添加到元数据
         doc.metadata.rrf_score = finalScore;
         return doc;
       });
 
-    console.log(
-      `[Retrieval] RRF 重排完成: 向量 ${vectorDocs.length} 个, BM25 ${bm25Docs.length} 个, 合并后 ${sortedDocs.length} 个`
+    log.info(
+      `RRF 重排完成: 向量 ${vectorDocs.length} 个, BM25 ${bm25Docs.length} 个, 合并后 ${sortedDocs.length} 个`
     );
 
     return sortedDocs;

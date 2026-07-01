@@ -47,6 +47,63 @@ export async function POST(request: Request) {
     );
   }
 
+  // 验证 history 数组
+  if (!Array.isArray(history)) {
+    return new Response(
+      JSON.stringify({ error: "history 必须是数组" }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  // 限制 history 最大条数，防止恶意请求消耗 token
+  const MAX_HISTORY_ITEMS = 20;
+  if (history.length > MAX_HISTORY_ITEMS) {
+    return new Response(
+      JSON.stringify({ error: `history 最多 ${MAX_HISTORY_ITEMS} 条消息` }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  // 验证每条 history 消息的格式和长度
+  const VALID_ROLES = new Set(["user", "assistant"]);
+  const MAX_HISTORY_CONTENT_LENGTH = 4000;
+  for (let i = 0; i < history.length; i++) {
+    const item = history[i];
+    if (
+      !item ||
+      typeof item !== "object" ||
+      !VALID_ROLES.has(item.role) ||
+      typeof item.content !== "string"
+    ) {
+      return new Response(
+        JSON.stringify({
+          error: `history[${i}] 格式无效：需要 { role: "user"|"assistant", content: string }`,
+        }),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+    if (item.content.length > MAX_HISTORY_CONTENT_LENGTH) {
+      return new Response(
+        JSON.stringify({
+          error: `history[${i}].content 不能超过 ${MAX_HISTORY_CONTENT_LENGTH} 字符`,
+        }),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+  }
+
   const encoder = new TextEncoder();
 
   const sendEvent = (event: SSEEvent): Uint8Array => {

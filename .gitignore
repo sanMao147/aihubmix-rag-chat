@@ -24,6 +24,7 @@
 .DS_Store
 *.pem
 .codebuddy/
+.learnings/
 
 # debug
 npm-debug.log*
